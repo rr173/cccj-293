@@ -61,6 +61,38 @@ class ExamCreateIn(BaseModel):
     shuffle: bool = True
 
 
+# ---------- Timed sessions / roster ----------
+
+
+class SessionConfigIn(BaseModel):
+    name: str = Field(min_length=1)
+    duration_seconds: int = Field(gt=0)
+    candidate_usernames: list[str] = Field(min_length=1)
+
+
+class TimedConfigIn(BaseModel):
+    # One entry per session; every candidate belongs to exactly one session.
+    sessions: list[SessionConfigIn] = Field(min_length=1)
+
+    @field_validator("sessions")
+    @classmethod
+    def _unique_session_names_and_roster(cls, sessions: list[SessionConfigIn]):
+        names = [s.name for s in sessions]
+        if len(names) != len(set(names)):
+            raise ValueError("session names must be unique")
+        all_candidates = [u for s in sessions for u in s.candidate_usernames]
+        if len(all_candidates) != len(set(all_candidates)):
+            raise ValueError("a candidate may belong to only one session")
+        if any(not u for u in all_candidates):
+            raise ValueError("candidate username must not be empty")
+        return sessions
+
+
+class ProctorActionIn(BaseModel):
+    op_id: str = Field(min_length=1, description="caller operation id (idempotency key)")
+    reason: Optional[str] = None
+
+
 # ---------- Answering ----------
 
 

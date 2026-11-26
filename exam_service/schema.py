@@ -1,4 +1,4 @@
-"""DDL and fixed seed data (the minimum three accounts)."""
+"""DDL, fixed seed data and lightweight additive migrations."""
 from __future__ import annotations
 
 from .db import Database
@@ -45,7 +45,10 @@ CREATE TABLE IF NOT EXISTS exams (
     -- [{"question_id":1,"version":1}]
     question_pins_json TEXT NOT NULL,
     -- display order: [question_id, ...] (stable for reconnects)
-    question_order_json TEXT NOT NULL
+    question_order_json TEXT NOT NULL,
+    -- Timed exams carry sessions/rosters; classic exams stay untimed.
+    timed_mode INTEGER NOT NULL DEFAULT 0,
+    default_duration_seconds INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS exam_questions (
@@ -63,6 +66,28 @@ CREATE TABLE IF NOT EXISTS exam_questions (
     UNIQUE (exam_id, question_id)
 );
 
+-- A timed exam is split into sessions (场次). Each roster candidate belongs
+-- to exactly one session. paused=1 means the whole session is suspended.
+CREATE TABLE IF NOT EXISTS exam_sessions (
+    id               INTEGER PRIMARY KEY,
+    exam_id          INTEGER NOT NULL REFERENCES exams(id),
+    name             TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL CHECK (duration_seconds > 0),
+    paused           INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    UNIQUE (exam_id, name)
+);
+
+-- The roster. Only enrolled candidates may open a timed exam.
+CREATE TABLE IF NOT EXISTS exam_enrollments (
+    id           INTEGER PRIMARY KEY,
+    exam_id      INTEGER NOT NULL REFERENCES exams(id),
+    session_id   INTEGER NOT NULL REFERENCES exam_sessions(id),
+    candidate_id INTEGER NOT NULL REFERENCES users(id),
+    created_at   TEXT NOT NULL,
+    UNIQUE (exam_id, candidate_id)
+);
+
 -- A candidate's attempt at one exam.
 CREATE TABLE IF NOT EXISTS attempts (
     id            INTEGER PRIMARY KEY,
@@ -74,12 +99,25 @@ CREATE TABLE IF NOT EXISTS attempts (
     revision      INTEGER NOT NULL DEFAULT 0,
     submitted_at  TEXT,
     created_at    TEXT NOT NULL,
+    -- Timed-attempt bookkeeping. NULL/0 means a classic untimed attempt.
+    timed_mode            INTEGER NOT NULL DEFAULT 0,
+    duration_seconds      INTEGER,
+    session_id            INTEGER REFERENCES exam_sessions(id),
+    -- Server time of the first successful paper open.
+    started_at            TEXT,
+    -- Set when the time limit consumed the attempt (submitted_at == cutoff).
+    auto_submitted_at     TEXT,
+    -- Server time at which the pending result version was generated.
+    graded_at             TEXT,
+    -- Candidate-level suspension flag (session suspension lives on exam_sessions).
+    candidate_paused      INTEGER NOT NULL DEFAULT 0,
     UNIQUE (exam_id, candidate_id)
 );
 
 -- Every save / submit call is recorded with the caller's operation id.
 -- The unique index makes caller retries idempotent (no second submit,
--- no duplicated save history).
+-- no duplicated save history). Automatic time-limit submissions are
+-- recorded as kind='submit' with a server-generated op_id.
 CREATE TABLE IF NOT EXISTS answer_operations (
     id           INTEGER PRIMARY KEY,
     attempt_id   INTEGER NOT NULL REFERENCES attempts(id),
@@ -90,6 +128,37 @@ CREATE TABLE IF NOT EXISTS answer_operations (
     created_at   TEXT NOT NULL,
     UNIQUE (attempt_id, op_id)
 );
+
+-- Append-only audit of proctor suspension actions. The unique (exam_id,
+-- op_id) index makes pause/resume retries idempotent exam-wide.
+CREATE TABLE IF NOT EXISTS proctor_events (
+    id           INTEGER PRIMARY KEY,
+    exam_id      INTEGER NOT NULL REFERENCES exams(id),
+    scope        TEXT NOT NULL CHECK (scope IN ('session', 'candidate')),
+    session_id   INTEGER,
+    candidate_id INTEGER,
+    action       TEXT NOT NULL CHECK (action IN ('pause', 'resume')),
+    op_id        TEXT NOT NULL,
+    reason       TEXT,
+    actor_id     INTEGER NOT NULL REFERENCES users(id),
+    created_at   TEXT NOT NULL,
+    UNIQUE (exam_id, op_id)
+);
+
+-- Wall-clock intervals during which an attempt's clock was stopped. One row
+-- per suspension layer; overlapping session/candidate intervals are merged
+-- when elapsed time is computed, so an overlap stops the clock only once.
+CREATE TABLE IF NOT EXISTS attempt_pause_intervals (
+    id              INTEGER PRIMARY KEY,
+    attempt_id      INTEGER NOT NULL REFERENCES attempts(id),
+    source          TEXT NOT NULL CHECK (source IN ('session', 'candidate')),
+    pause_event_id  INTEGER NOT NULL REFERENCES proctor_events(id),
+    pause_at        TEXT NOT NULL,
+    resume_event_id INTEGER REFERENCES proctor_events(id),
+    resume_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pause_intervals_attempt
+    ON attempt_pause_intervals(attempt_id);
 
 -- Scoring schemes. The active one for an exam is the highest version.
 -- Editing the answer key creates a new scheme; exam content and max scores
@@ -156,6 +225,23 @@ CREATE TABLE IF NOT EXISTS grading_runs (
 );
 """
 
+# Additive migrations for databases created before timed sessions existed.
+_ADDED_COLUMNS = {
+    "exams": [
+        ("timed_mode", "INTEGER NOT NULL DEFAULT 0"),
+        ("default_duration_seconds", "INTEGER"),
+    ],
+    "attempts": [
+        ("timed_mode", "INTEGER NOT NULL DEFAULT 0"),
+        ("duration_seconds", "INTEGER"),
+        ("session_id", "INTEGER REFERENCES exam_sessions(id)"),
+        ("started_at", "TEXT"),
+        ("auto_submitted_at", "TEXT"),
+        ("graded_at", "TEXT"),
+        ("candidate_paused", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+}
+
 # Minimal credentials for the demo. Passwords are PBKDF2-hashed at seed time.
 SEED_USERS = [
     ("admin", "admin-pass-123", "admin", "题库管理员"),
@@ -164,9 +250,18 @@ SEED_USERS = [
 ]
 
 
+def _existing_columns(conn, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def init_db(db: Database) -> None:
     with db.write() as conn:
         conn.executescript(SCHEMA_SQL)
+        for table, columns in _ADDED_COLUMNS.items():
+            present = _existing_columns(conn, table)
+            for name, ddl in columns:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         for username, password, role, display_name in SEED_USERS:
             exists = conn.execute(
                 "SELECT 1 FROM users WHERE username = ?", (username,)

@@ -9,15 +9,18 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 
 from . import service
+from .clock import Clock, RealClock
 from .db import Database
 from .schemas import (
     AnswerKeyEditIn,
     AnswerSaveIn,
     ExamCreateIn,
     ManualScoreIn,
+    ProctorActionIn,
     PublishIn,
     QuestionVersionIn,
     SubmitIn,
+    TimedConfigIn,
 )
 from .schema import init_db
 from .security import (
@@ -27,15 +30,19 @@ from .security import (
 )
 
 
-def create_app(db_path: str | Path = "exam.db") -> FastAPI:
+def create_app(
+    db_path: str | Path = "exam.db", clock: Clock | None = None
+) -> FastAPI:
     db = Database(db_path)
     init_db(db)
+    clock = clock or RealClock()
 
     app = FastAPI(
         title="Exam Service",
-        version="1.0",
+        version="1.1",
         description="Issue -> answer -> grade -> publish, with snapshots,"
-        " optimistic revisions, idempotent submit and versioned results.",
+        " optimistic revisions, idempotent submit, versioned results and"
+        " timed sessions with two-layer pause/resume.",
     )
     authenticate = get_current_user_factory(db)
     require_roles = require_roles_factory(authenticate)
@@ -64,6 +71,11 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
     def health():
         return {"status": "ok"}
 
+    @app.get("/server-time")
+    def server_time():
+        # Explicit server clock; timed attempts also echo it in their timing block.
+        return {"now": clock.now_iso()}
+
     @app.get("/me")
     def me(user: CurrentUser = Depends(authenticate)):
         return {
@@ -79,7 +91,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
     def create_question(
         payload: QuestionVersionIn, _: CurrentUser = Depends(admin_only)
     ):
-        return service.create_question(db, payload)
+        return service.create_question(db, payload, clock)
 
     @app.post("/admin/questions/{question_id}/versions", status_code=201)
     def edit_question(
@@ -87,7 +99,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
         payload: QuestionVersionIn,
         _: CurrentUser = Depends(admin_only),
     ):
-        return service.edit_question(db, question_id, payload)
+        return service.edit_question(db, question_id, payload, clock)
 
     @app.get("/admin/questions")
     def list_questions(_: CurrentUser = Depends(staff)):
@@ -98,17 +110,80 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
     @app.post("/admin/exams", status_code=201)
     def create_exam(payload: ExamCreateIn, _: CurrentUser = Depends(admin_only)):
         pins = [p.model_dump() for p in payload.questions]
-        return service.create_exam(db, payload.title, pins, payload.shuffle)
+        return service.create_exam(db, payload.title, pins, payload.shuffle, clock)
 
     @app.get("/admin/exams/{exam_id}")
     def get_exam(exam_id: int, _: CurrentUser = Depends(staff)):
         return service.get_exam(db, exam_id)
 
+    # ---------------- Timed sessions & roster (admin) ----------------
+
+    @app.post("/admin/exams/{exam_id}/timed-config", status_code=201)
+    def configure_timed_exam(
+        exam_id: int,
+        payload: TimedConfigIn,
+        _: CurrentUser = Depends(admin_only),
+    ):
+        sessions = [s.model_dump() for s in payload.sessions]
+        return service.configure_timed_exam(db, exam_id, sessions, clock)
+
+    @app.post("/admin/exams/{exam_id}/sessions/{session_id}/pause")
+    def pause_session(
+        exam_id: int,
+        session_id: int,
+        payload: ProctorActionIn,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        return service.pause_session(
+            db, exam_id, session_id, payload.op_id, payload.reason, user.id, clock
+        )
+
+    @app.post("/admin/exams/{exam_id}/sessions/{session_id}/resume")
+    def resume_session(
+        exam_id: int,
+        session_id: int,
+        payload: ProctorActionIn,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        return service.resume_session(
+            db, exam_id, session_id, payload.op_id, payload.reason, user.id, clock
+        )
+
+    @app.post("/admin/exams/{exam_id}/candidates/{username}/pause")
+    def pause_candidate(
+        exam_id: int,
+        username: str,
+        payload: ProctorActionIn,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        with db.read() as conn:
+            candidate = _resolve_candidate(conn, username)
+        return service.pause_candidate(
+            db, exam_id, candidate["id"], payload.op_id, payload.reason, user.id, clock
+        )
+
+    @app.post("/admin/exams/{exam_id}/candidates/{username}/resume")
+    def resume_candidate(
+        exam_id: int,
+        username: str,
+        payload: ProctorActionIn,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        with db.read() as conn:
+            candidate = _resolve_candidate(conn, username)
+        return service.resume_candidate(
+            db, exam_id, candidate["id"], payload.op_id, payload.reason, user.id, clock
+        )
+
+    @app.get("/admin/exams/{exam_id}/proctor-events")
+    def list_proctor_events(exam_id: int, _: CurrentUser = Depends(staff)):
+        return service.list_proctor_events(db, exam_id)
+
     # ---------------- Candidate answering ----------------
 
     @app.get("/exams/{exam_id}/paper")
     def get_paper(exam_id: int, user: CurrentUser = Depends(candidate_only)):
-        return service.get_paper(db, exam_id, user.id)
+        return service.get_paper(db, exam_id, user.id, clock)
 
     @app.post("/exams/{exam_id}/answers")
     def save_answers(
@@ -123,6 +198,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
             payload.op_id,
             payload.base_revision,
             payload.answers,
+            clock,
         )
 
     @app.post("/exams/{exam_id}/submit")
@@ -131,11 +207,11 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
         payload: SubmitIn,
         user: CurrentUser = Depends(candidate_only),
     ):
-        return service.submit_attempt(db, exam_id, user.id, payload.op_id)
+        return service.submit_attempt(db, exam_id, user.id, payload.op_id, clock)
 
     @app.get("/exams/{exam_id}/result")
     def get_my_result(exam_id: int, user: CurrentUser = Depends(candidate_only)):
-        return service.get_published_result(db, exam_id, user.id)
+        return service.get_published_result(db, exam_id, user.id, clock)
 
     # ---------------- Grading (staff) ----------------
 
@@ -150,6 +226,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
             exam_id,
             [item.model_dump() for item in payload.answer_key],
             payload.reason,
+            clock,
         )
 
     @app.post(
@@ -163,7 +240,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
         with db.read() as conn:
             candidate = _resolve_candidate(conn, username)
         return service.regrade(
-            db, exam_id, candidate["id"], trigger=f"regrade by {user.username}"
+            db, exam_id, candidate["id"], trigger=f"regrade by {user.username}", clock=clock
         )
 
     @app.put(
@@ -186,6 +263,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
             payload.score,
             payload.reason,
             user.id,
+            clock,
         )
 
     @app.get("/grading/exams/{exam_id}/candidates/{username}/results")
@@ -198,7 +276,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
             candidate = _resolve_candidate(conn, username)
         return {
             "candidate": candidate,
-            "results": service.list_result_versions(db, exam_id, candidate["id"]),
+            "results": service.list_result_versions(db, exam_id, candidate["id"], clock),
         }
 
     @app.post("/grading/exams/{exam_id}/candidates/{username}/publish")
@@ -211,7 +289,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
         with db.read() as conn:
             candidate = _resolve_candidate(conn, username)
         return service.publish_result(
-            db, exam_id, candidate["id"], payload.result_version
+            db, exam_id, candidate["id"], payload.result_version, clock
         )
 
     @app.get("/grading/exams/{exam_id}/candidates/{username}/history")
@@ -222,7 +300,7 @@ def create_app(db_path: str | Path = "exam.db") -> FastAPI:
     ):
         with db.read() as conn:
             candidate = _resolve_candidate(conn, username)
-        return service.get_grading_history(db, exam_id, candidate["id"])
+        return service.get_grading_history(db, exam_id, candidate["id"], clock)
 
     return app
 
