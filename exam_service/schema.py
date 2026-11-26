@@ -68,12 +68,15 @@ CREATE TABLE IF NOT EXISTS exam_questions (
 
 -- A timed exam is split into sessions (场次). Each roster candidate belongs
 -- to exactly one session. paused=1 means the whole session is suspended.
+-- capacity is NULL for regular timed sessions (no seat limit); makeup
+-- sessions created by a reservation campaign carry a positive seat count.
 CREATE TABLE IF NOT EXISTS exam_sessions (
     id               INTEGER PRIMARY KEY,
     exam_id          INTEGER NOT NULL REFERENCES exams(id),
     name             TEXT NOT NULL,
     duration_seconds INTEGER NOT NULL CHECK (duration_seconds > 0),
     paused           INTEGER NOT NULL DEFAULT 0,
+    capacity         INTEGER,
     created_at       TEXT NOT NULL,
     UNIQUE (exam_id, name)
 );
@@ -86,6 +89,82 @@ CREATE TABLE IF NOT EXISTS exam_enrollments (
     candidate_id INTEGER NOT NULL REFERENCES users(id),
     created_at   TEXT NOT NULL,
     UNIQUE (exam_id, candidate_id)
+);
+
+-- Makeup (补考) reservation campaigns. One per exam; the exam becomes a
+-- timed exam whose sessions carry a seat capacity. Eligibility is dynamic:
+-- the candidate's currently published total on the basis exam must be below
+-- the pass line. No roster is pre-filled; seats are granted by confirming
+-- invitations, and confirmations are mirrored into exam_enrollments.
+CREATE TABLE IF NOT EXISTS makeup_campaigns (
+    id                 INTEGER PRIMARY KEY,
+    exam_id            INTEGER NOT NULL UNIQUE REFERENCES exams(id),
+    basis_exam_id      INTEGER NOT NULL REFERENCES exams(id),
+    pass_score         INTEGER NOT NULL CHECK (pass_score > 0),
+    invite_ttl_seconds INTEGER NOT NULL CHECK (invite_ttl_seconds > 0),
+    created_at         TEXT NOT NULL
+);
+
+-- One row per application (申请). A candidate holds at most one active
+-- (waitlisted/invited) application and at most one seated
+-- (confirmed/completed) application per campaign; both partial unique
+-- indexes are enforced by SQLite. Terminal states: cancelled ( withdrew /
+-- unsubscribed ), expired (invitation TTL elapsed), voided (eligibility
+-- lost), switched (moved to another session), completed (exam started).
+CREATE TABLE IF NOT EXISTS makeup_applications (
+    id           INTEGER PRIMARY KEY,
+    campaign_id  INTEGER NOT NULL REFERENCES makeup_campaigns(id),
+    candidate_id INTEGER NOT NULL REFERENCES users(id),
+    session_id   INTEGER NOT NULL REFERENCES exam_sessions(id),
+    state        TEXT NOT NULL CHECK (state IN (
+                     'waitlisted', 'invited', 'confirmed', 'completed',
+                     'cancelled', 'expired', 'voided', 'switched'
+                 )),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_makeup_applications_active
+    ON makeup_applications(campaign_id, candidate_id)
+    WHERE state IN ('waitlisted', 'invited');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_makeup_applications_seated
+    ON makeup_applications(campaign_id, candidate_id)
+    WHERE state IN ('confirmed', 'completed');
+CREATE INDEX IF NOT EXISTS idx_makeup_applications_session
+    ON makeup_applications(session_id, state);
+
+-- Invitations are individually identifiable: a pending invitation holds one
+-- seat from its actual issue instant until expires_at. An invitation that
+-- expired / was voided / cancelled can never confirm a (new) seat.
+CREATE TABLE IF NOT EXISTS makeup_invitations (
+    id             INTEGER PRIMARY KEY,
+    application_id INTEGER NOT NULL REFERENCES makeup_applications(id),
+    campaign_id    INTEGER NOT NULL REFERENCES makeup_campaigns(id),
+    session_id     INTEGER NOT NULL REFERENCES exam_sessions(id),
+    candidate_id   INTEGER NOT NULL REFERENCES users(id),
+    seq            INTEGER NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN (
+                       'pending', 'confirmed', 'expired', 'voided', 'cancelled'
+                   )),
+    issued_at      TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    UNIQUE (application_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_makeup_invitations_application
+    ON makeup_invitations(application_id);
+
+-- Scoped idempotency records for makeup writes. Same contract as
+-- appeal_operations: a reused op_id with a different request is a 409, a
+-- replay returns the recorded result without touching any seat.
+CREATE TABLE IF NOT EXISTS makeup_operations (
+    scope        TEXT NOT NULL,
+    op_id        TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    actor_id     INTEGER REFERENCES users(id),
+    result_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (scope, op_id),
+    UNIQUE (op_id)
 );
 
 -- A candidate's attempt at one exam.
@@ -334,6 +413,10 @@ _ADDED_COLUMNS = {
     "exams": [
         ("timed_mode", "INTEGER NOT NULL DEFAULT 0"),
         ("default_duration_seconds", "INTEGER"),
+    ],
+    "exam_sessions": [
+        # NULL = regular timed session (no seat limit); makeup sessions set it.
+        ("capacity", "INTEGER"),
     ],
     "attempts": [
         ("timed_mode", "INTEGER NOT NULL DEFAULT 0"),

@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .clock import Clock, RealClock
@@ -258,8 +258,8 @@ def _exam_out(conn, exam_id: int) -> dict[str, Any]:
     }
     if exam["timed_mode"]:
         sessions = conn.execute(
-            "SELECT id, name, duration_seconds, paused, created_at FROM exam_sessions"
-            " WHERE exam_id = ? ORDER BY id",
+            "SELECT id, name, duration_seconds, paused, created_at, capacity"
+            " FROM exam_sessions WHERE exam_id = ? ORDER BY id",
             (exam_id,),
         ).fetchall()
         out["sessions"] = [
@@ -267,6 +267,7 @@ def _exam_out(conn, exam_id: int) -> dict[str, Any]:
                 "session_id": s["id"],
                 "name": s["name"],
                 "duration_seconds": s["duration_seconds"],
+                "capacity": s["capacity"],
                 "paused": bool(s["paused"]),
                 "candidates": [
                     r["username"]
@@ -553,6 +554,9 @@ def _get_or_create_attempt(
                 1 if candidate_flag else 0,
             ),
         )
+        # A first successful start on a makeup exam finalizes the candidate's
+        # reservation state in the same transaction (no half-finished moves).
+        _makeup_on_exam_start(conn, exam_id, candidate_id, clock)
     else:
         cur = conn.execute(
             "INSERT INTO attempts (exam_id, candidate_id, status, answers_json, revision,"
@@ -1527,6 +1531,9 @@ def publish_result(
             (published_at, target["id"]),
         )
         _mark_published_appeal_corrections(conn, target["id"], published_at)
+        # A new published total may void pending makeup waitlists/invitations
+        # that rely on this exam as their eligibility basis (same transaction).
+        _makeup_on_result_published(conn, exam_id, candidate_id, clock)
         return _result_summary(
             conn,
             conn.execute(
@@ -2727,4 +2734,851 @@ def _mark_published_appeal_corrections(
             " WHERE final_ruling_id = ? AND correction_published_at IS NULL",
             (published_at, ruling_id),
         )
+
+
+# =========================== Makeup reservations (补考分场预约) ===========================
+#
+# A makeup campaign turns a fresh, not-yet-timed exam into a timed exam whose
+# sessions have a seat capacity. There is no pre-filled roster: candidates
+# whose CURRENTLY PUBLISHED total on the basis exam is below the pass line
+# apply for a session. A free seat immediately produces an invitation (which
+# holds the seat until its deadline); otherwise the application waits in the
+# session's FIFO queue. Confirming an invitation mirrors the candidate into
+# exam_enrollments, so the existing timed machinery (roster gate, two-layer
+# pause, lazy auto-submit) applies unchanged.
+#
+# All seat accounting is derived from application/invitation state inside the
+# global write transaction, so a restart can never overbook a session or
+# leave a session switch half-applied. Expiry/eligibility/promotion are
+# settled lazily: every makeup read or write first settles the campaign, so
+# invitations expire on schedule even while the service was offline (and are
+# never re-issued afterwards).
+
+_MAKEUP_ACTIVE_STATES = ("waitlisted", "invited")
+_MAKEUP_SEAT_STATES = ("invited", "confirmed", "completed")
+
+
+def _get_makeup_campaign(conn, exam_id: int):
+    return conn.execute(
+        "SELECT * FROM makeup_campaigns WHERE exam_id = ?", (exam_id,)
+    ).fetchone()
+
+
+def _require_makeup_campaign(conn, exam_id: int):
+    campaign = _get_makeup_campaign(conn, exam_id)
+    if campaign is None:
+        raise ServiceError(
+            404, f"exam {exam_id} has no makeup reservation campaign"
+        )
+    return campaign
+
+
+def _makeup_published_total(conn, basis_exam_id: int, candidate_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT total_score FROM result_versions"
+        " WHERE exam_id = ? AND candidate_id = ? AND status = 'published'",
+        (basis_exam_id, candidate_id),
+    ).fetchone()
+    return row["total_score"] if row is not None else None
+
+
+def _makeup_eligibility(conn, campaign, candidate_id: int) -> tuple[bool, int | None]:
+    """Eligible iff the basis exam's published total is below the pass line.
+
+    An unpublished result does not count in either direction.
+    """
+    total = _makeup_published_total(conn, campaign["basis_exam_id"], candidate_id)
+    return (total is not None and total < campaign["pass_score"]), total
+
+
+def _makeup_session_counts(conn, session_id: int, capacity: int | None) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT state, COUNT(*) AS n FROM makeup_applications"
+        " WHERE session_id = ? AND state IN ('invited', 'confirmed', 'completed', 'waitlisted')"
+        " GROUP BY state",
+        (session_id,),
+    ).fetchall()
+    by_state = {r["state"]: r["n"] for r in rows}
+    invited = by_state.get("invited", 0)
+    confirmed = by_state.get("confirmed", 0)
+    completed = by_state.get("completed", 0)
+    waitlisted = by_state.get("waitlisted", 0)
+    free_seats = None
+    if capacity is not None:
+        # A pending invitation holds a seat exactly like a confirmed one.
+        free_seats = max(0, capacity - invited - confirmed - completed)
+    return {
+        "confirmed": confirmed,
+        "completed": completed,
+        "invited": invited,
+        "waitlisted": waitlisted,
+        "free_seats": free_seats,
+    }
+
+
+def _promote_makeup_session_locked(
+    conn, clock: Clock, campaign, session_id: int, now: datetime
+) -> None:
+    """Invite waitlisted candidates (application order) into free seats."""
+    session = conn.execute(
+        "SELECT * FROM exam_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if session is None or session["capacity"] is None:
+        return
+    counts = _makeup_session_counts(conn, session_id, session["capacity"])
+    free = counts["free_seats"]
+    if free <= 0:
+        return
+    waiting = conn.execute(
+        "SELECT * FROM makeup_applications"
+        " WHERE session_id = ? AND state = 'waitlisted' ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    now_iso = clock.iso(now)
+    expires_iso = clock.iso(now + timedelta(seconds=campaign["invite_ttl_seconds"]))
+    for application in waiting[:free]:
+        conn.execute(
+            "INSERT INTO makeup_invitations"
+            " (application_id, campaign_id, session_id, candidate_id, seq,"
+            "  status, issued_at, expires_at)"
+            " VALUES (?, ?, ?, ?, 1, 'pending', ?, ?)",
+            (
+                application["id"],
+                campaign["id"],
+                session_id,
+                application["candidate_id"],
+                now_iso,
+                expires_iso,
+            ),
+        )
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'invited', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, application["id"]),
+        )
+
+
+def _settle_makeup_campaign_locked(
+    conn, clock: Clock, campaign, now: datetime
+) -> None:
+    """Apply expirations, eligibility voiding and promotions for a campaign.
+
+    Idempotent and lazy: safe to run on every touch. Expired invitations keep
+    their original expiry instant as the resolution time, so a service that
+    was offline still expires them on schedule and never re-issues them.
+    """
+    now_iso = clock.iso(now)
+    now_us = clock.micros(now)
+
+    # 1. Expire pending invitations whose confirmation deadline has passed.
+    pending = conn.execute(
+        "SELECT * FROM makeup_invitations WHERE campaign_id = ? AND status = 'pending'",
+        (campaign["id"],),
+    ).fetchall()
+    for invitation in pending:
+        if clock.micros(clock.parse(invitation["expires_at"])) <= now_us:
+            conn.execute(
+                "UPDATE makeup_invitations SET status = 'expired',"
+                " resolved_at = expires_at WHERE id = ?",
+                (invitation["id"],),
+            )
+            # The application itself ends when its invitation expires.
+            conn.execute(
+                "UPDATE makeup_applications SET state = 'expired', updated_at = ?"
+                " WHERE id = ? AND state = 'invited'",
+                (invitation["expires_at"], invitation["application_id"]),
+            )
+
+    # 2. Void active applications whose candidate lost eligibility. Confirmed
+    #    seats are never revoked; a voided application stays void even if
+    #    eligibility later returns (the candidate must re-apply).
+    active = conn.execute(
+        "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+        " AND state IN ('waitlisted', 'invited')",
+        (campaign["id"],),
+    ).fetchall()
+    for application in active:
+        eligible, _ = _makeup_eligibility(conn, campaign, application["candidate_id"])
+        if eligible:
+            continue
+        if application["state"] == "invited":
+            conn.execute(
+                "UPDATE makeup_invitations SET status = 'voided', resolved_at = ?"
+                " WHERE application_id = ? AND status = 'pending'",
+                (now_iso, application["id"]),
+            )
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'voided', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, application["id"]),
+        )
+
+    # 3. Promote the queue into whatever seats are now free.
+    sessions = conn.execute(
+        "SELECT id FROM exam_sessions WHERE exam_id = ?", (campaign["exam_id"],)
+    ).fetchall()
+    for session in sessions:
+        _promote_makeup_session_locked(conn, clock, campaign, session["id"], now)
+
+
+def _settle_makeup(db: Database, exam_id: int, clock: Clock) -> None:
+    """Settle a campaign from read endpoints (no-op for non-makeup exams)."""
+    with db.write() as conn:
+        campaign = _get_makeup_campaign(conn, exam_id)
+        if campaign is not None:
+            _settle_makeup_campaign_locked(conn, clock, campaign, clock.now())
+
+
+def _makeup_op_replay(conn, scope: str, op_id: str | None, request_payload: dict,
+                      actor_id: int):
+    """Idempotency check for makeup writes.
+
+    Returns ``(replay_result, op_id, request_hash)``; the replay result is
+    the recorded first response and is returned without touching any seat.
+    """
+    if not op_id or not str(op_id).strip():
+        raise ServiceError(422, "op_id is required for retry-safe operations")
+    op_id = str(op_id)
+    canonical = _dumps(
+        {"actor_id": actor_id, "request": request_payload, "scope": scope}
+    )
+    request_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    row = conn.execute(
+        "SELECT * FROM makeup_operations WHERE op_id = ?", (op_id,)
+    ).fetchone()
+    if row is None:
+        return None, op_id, request_hash
+    if row["scope"] != scope or row["request_hash"] != request_hash:
+        raise ServiceError(
+            409,
+            f"op_id '{op_id}' was already used for a different request;"
+            " use a new op_id for a new operation",
+        )
+    result = _loads(row["result_json"])
+    result["idempotent_replay"] = True
+    result["note"] = "op_id already processed; replay changes nothing"
+    return result, op_id, request_hash
+
+
+def _makeup_op_store(conn, scope: str, op_id: str, request_hash: str,
+                     actor_id: int, result: dict[str, Any], clock: Clock):
+    conn.execute(
+        "INSERT INTO makeup_operations"
+        " (scope, op_id, request_hash, actor_id, result_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (scope, op_id, request_hash, actor_id, _dumps(result), clock.now_iso()),
+    )
+    return result
+
+
+def _makeup_invitation_view(row) -> dict[str, Any]:
+    return {
+        "invitation_id": row["id"],
+        "application_id": row["application_id"],
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "issued_at": row["issued_at"],
+        "expires_at": row["expires_at"],
+        "resolved_at": row["resolved_at"],
+    }
+
+
+def _makeup_application_view(conn, row) -> dict[str, Any]:
+    session = conn.execute(
+        "SELECT id, name FROM exam_sessions WHERE id = ?", (row["session_id"],)
+    ).fetchone()
+    invitation = conn.execute(
+        "SELECT * FROM makeup_invitations WHERE application_id = ?"
+        " ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    queue_position = None
+    if row["state"] == "waitlisted":
+        queue_position = conn.execute(
+            "SELECT COUNT(*) + 1 AS pos FROM makeup_applications"
+            " WHERE session_id = ? AND state = 'waitlisted' AND id < ?",
+            (row["session_id"], row["id"]),
+        ).fetchone()["pos"]
+    return {
+        "application_id": row["id"],
+        "campaign_id": row["campaign_id"],
+        "candidate_id": row["candidate_id"],
+        "session_id": row["session_id"],
+        "session_name": session["name"] if session is not None else None,
+        "state": row["state"],
+        "queue_position": queue_position,
+        "invitation": _makeup_invitation_view(invitation)
+        if invitation is not None
+        else None,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _makeup_campaign_view(conn, campaign, *, include_applications: bool) -> dict[str, Any]:
+    sessions = conn.execute(
+        "SELECT * FROM exam_sessions WHERE exam_id = ? ORDER BY id",
+        (campaign["exam_id"],),
+    ).fetchall()
+    session_views = []
+    for s in sessions:
+        counts = _makeup_session_counts(conn, s["id"], s["capacity"])
+        session_views.append(
+            {
+                "session_id": s["id"],
+                "name": s["name"],
+                "duration_seconds": s["duration_seconds"],
+                "capacity": s["capacity"],
+                "paused": bool(s["paused"]),
+                **counts,
+            }
+        )
+    view: dict[str, Any] = {
+        "campaign_id": campaign["id"],
+        "exam_id": campaign["exam_id"],
+        "basis_exam_id": campaign["basis_exam_id"],
+        "pass_score": campaign["pass_score"],
+        "invite_ttl_seconds": campaign["invite_ttl_seconds"],
+        "created_at": campaign["created_at"],
+        "sessions": session_views,
+    }
+    if include_applications:
+        rows = conn.execute(
+            "SELECT a.*, u.username FROM makeup_applications a"
+            " JOIN users u ON u.id = a.candidate_id"
+            " WHERE a.campaign_id = ? ORDER BY a.id",
+            (campaign["id"],),
+        ).fetchall()
+        view["applications"] = [
+            {**_makeup_application_view(conn, r), "username": r["username"]}
+            for r in rows
+        ]
+    return view
+
+
+def create_makeup_campaign(
+    db: Database,
+    exam_id: int,
+    op_id: str | None,
+    basis_exam_id: int,
+    pass_score: int,
+    invite_ttl_seconds: int,
+    sessions_in: list[dict[str, Any]],
+    admin_id: int,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    """Open the (single) makeup reservation campaign for an exam.
+
+    The exam must not be timed-configured yet and must have no attempts; it
+    becomes a timed exam whose sessions carry the given capacities.
+    """
+    with db.write() as conn:
+        exam = conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone()
+        if exam is None:
+            raise ServiceError(404, f"exam {exam_id} not found")
+        scope = f"makeup-create:{exam_id}"
+        request = {
+            "basis_exam_id": basis_exam_id,
+            "pass_score": pass_score,
+            "invite_ttl_seconds": invite_ttl_seconds,
+            "sessions": sessions_in,
+        }
+        replay, op_id, request_hash = _makeup_op_replay(
+            conn, scope, op_id, request, admin_id
+        )
+        if replay is not None:
+            return replay
+        if exam["timed_mode"]:
+            raise ServiceError(
+                409,
+                f"exam {exam_id} is already configured with timed sessions;"
+                " makeup reservations require an unconfigured exam",
+            )
+        if _get_makeup_campaign(conn, exam_id) is not None:
+            raise ServiceError(
+                409, f"exam {exam_id} already has a makeup reservation campaign"
+            )
+        existing = conn.execute(
+            "SELECT 1 FROM attempts WHERE exam_id = ? LIMIT 1", (exam_id,)
+        ).fetchone()
+        if existing is not None:
+            raise ServiceError(
+                409, "exam already has attempts; makeup reservations must precede any start"
+            )
+        if basis_exam_id == exam_id:
+            raise ServiceError(422, "the basis exam must be a different exam")
+        basis = conn.execute(
+            "SELECT id FROM exams WHERE id = ?", (basis_exam_id,)
+        ).fetchone()
+        if basis is None:
+            raise ServiceError(422, f"basis exam {basis_exam_id} not found")
+        names = [s["name"] for s in sessions_in]
+        if len(names) != len(set(names)):
+            raise ServiceError(422, "session names must be unique")
+
+        now_iso = clock.now_iso()
+        cur = conn.execute(
+            "INSERT INTO makeup_campaigns"
+            " (exam_id, basis_exam_id, pass_score, invite_ttl_seconds, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (exam_id, basis_exam_id, pass_score, invite_ttl_seconds, now_iso),
+        )
+        campaign_id = cur.lastrowid
+        for s in sessions_in:
+            conn.execute(
+                "INSERT INTO exam_sessions"
+                " (exam_id, name, duration_seconds, paused, created_at, capacity)"
+                " VALUES (?, ?, ?, 0, ?, ?)",
+                (exam_id, s["name"], s["duration_seconds"], now_iso, s["capacity"]),
+            )
+        conn.execute("UPDATE exams SET timed_mode = 1 WHERE id = ?", (exam_id,))
+        campaign = conn.execute(
+            "SELECT * FROM makeup_campaigns WHERE id = ?", (campaign_id,)
+        ).fetchone()
+        result = _makeup_campaign_view(conn, campaign, include_applications=True)
+        result["idempotent_replay"] = False
+        return _makeup_op_store(
+            conn, scope, op_id, request_hash, admin_id, result, clock
+        )
+
+
+def apply_makeup(
+    db: Database,
+    exam_id: int,
+    candidate_id: int,
+    op_id: str | None,
+    session_id: int,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    """Apply for a makeup session. A free seat invites immediately."""
+    with db.write() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        now = clock.now()
+        _settle_makeup_campaign_locked(conn, clock, campaign, now)
+        scope = f"makeup-apply:{campaign['id']}:{candidate_id}"
+        replay, op_id, request_hash = _makeup_op_replay(
+            conn, scope, op_id, {"session_id": session_id}, candidate_id
+        )
+        if replay is not None:
+            return replay
+        session = conn.execute(
+            "SELECT * FROM exam_sessions WHERE id = ? AND exam_id = ?",
+            (session_id, exam_id),
+        ).fetchone()
+        if session is None:
+            raise ServiceError(404, f"session {session_id} not found on exam {exam_id}")
+        eligible, total = _makeup_eligibility(conn, campaign, candidate_id)
+        if not eligible:
+            if total is None:
+                raise ServiceError(
+                    403,
+                    "no published result on the basis exam; only candidates whose"
+                    " current published total is below the pass line may apply",
+                )
+            raise ServiceError(
+                403,
+                f"published total {total} is not below the pass line"
+                f" {campaign['pass_score']}",
+            )
+        attempt = conn.execute(
+            "SELECT 1 FROM attempts WHERE exam_id = ? AND candidate_id = ?",
+            (exam_id, candidate_id),
+        ).fetchone()
+        if attempt is not None:
+            raise ServiceError(
+                409, "the makeup exam has already been started; applications are closed"
+            )
+        active = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? AND state IN ('waitlisted', 'invited')",
+            (campaign["id"], candidate_id),
+        ).fetchone()
+        if active is not None:
+            raise ServiceError(
+                409,
+                f"application {active['id']} is already {active['state']};"
+                " only one session may be pursued at a time",
+            )
+        seated = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? AND state IN ('confirmed', 'completed')",
+            (campaign["id"], candidate_id),
+        ).fetchone()
+        if seated is not None:
+            if seated["state"] == "completed":
+                raise ServiceError(
+                    409,
+                    "the makeup exam has already been started; applications are closed",
+                )
+            if seated["session_id"] == session_id:
+                raise ServiceError(
+                    409,
+                    "already confirmed in this session; only other sessions"
+                    " may be waitlisted",
+                )
+
+        now_iso = clock.now_iso()
+        cur = conn.execute(
+            "INSERT INTO makeup_applications"
+            " (campaign_id, candidate_id, session_id, state, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'waitlisted', ?, ?)",
+            (campaign["id"], candidate_id, session_id, now_iso, now_iso),
+        )
+        application_id = cur.lastrowid
+        # A free seat promotes the new application into an invitation at once.
+        _promote_makeup_session_locked(conn, clock, campaign, session_id, now)
+        row = conn.execute(
+            "SELECT * FROM makeup_applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        result = _makeup_application_view(conn, row)
+        result["idempotent_replay"] = False
+        return _makeup_op_store(
+            conn, scope, op_id, request_hash, candidate_id, result, clock
+        )
+
+
+def confirm_makeup_invitation(
+    db: Database,
+    exam_id: int,
+    invitation_id: int,
+    candidate_id: int,
+    op_id: str | None,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    """Confirm one specific invitation; grants the roster seat for its session.
+
+    If the candidate already holds a confirmed seat in another session, the
+    switch is atomic: the old seat is released (and its queue promoted) in
+    the same transaction that confirms the new one.
+    """
+    with db.write() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        now = clock.now()
+        _settle_makeup_campaign_locked(conn, clock, campaign, now)
+        invitation = conn.execute(
+            "SELECT * FROM makeup_invitations WHERE id = ? AND campaign_id = ?",
+            (invitation_id, campaign["id"]),
+        ).fetchone()
+        if invitation is None or invitation["candidate_id"] != candidate_id:
+            # Do not reveal other candidates' invitations.
+            raise ServiceError(404, f"invitation {invitation_id} not found")
+        scope = f"makeup-confirm:{invitation_id}"
+        replay, op_id, request_hash = _makeup_op_replay(
+            conn, scope, op_id, {"invitation_id": invitation_id}, candidate_id
+        )
+        if replay is not None:
+            return replay
+        if invitation["status"] != "pending":
+            raise ServiceError(
+                409,
+                f"invitation {invitation_id} is {invitation['status']};"
+                " it cannot confirm a seat",
+            )
+        application = conn.execute(
+            "SELECT * FROM makeup_applications WHERE id = ?",
+            (invitation["application_id"],),
+        ).fetchone()
+        if application["state"] != "invited":
+            raise ServiceError(
+                409,
+                f"application {application['id']} is {application['state']};"
+                " the invitation is no longer valid",
+            )
+        eligible, total = _makeup_eligibility(conn, campaign, candidate_id)
+        if not eligible:
+            raise ServiceError(
+                403,
+                "eligibility requires a current published total below the"
+                " pass line at confirmation time",
+            )
+
+        now_iso = clock.now_iso()
+        current = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? AND state = 'confirmed'",
+            (campaign["id"], candidate_id),
+        ).fetchone()
+        switched_from = None
+        if current is not None:
+            # Atomic switch: release the old seat only as the new one is taken.
+            conn.execute(
+                "UPDATE makeup_applications SET state = 'switched', updated_at = ?"
+                " WHERE id = ?",
+                (now_iso, current["id"]),
+            )
+            conn.execute(
+                "UPDATE exam_enrollments SET session_id = ?"
+                " WHERE exam_id = ? AND candidate_id = ?",
+                (application["session_id"], exam_id, candidate_id),
+            )
+            switched_from = current
+        else:
+            conn.execute(
+                "INSERT INTO exam_enrollments (exam_id, session_id, candidate_id, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (exam_id, application["session_id"], candidate_id, now_iso),
+            )
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'confirmed', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, application["id"]),
+        )
+        conn.execute(
+            "UPDATE makeup_invitations SET status = 'confirmed', resolved_at = ?"
+            " WHERE id = ?",
+            (now_iso, invitation_id),
+        )
+        if switched_from is not None:
+            _promote_makeup_session_locked(
+                conn, clock, campaign, switched_from["session_id"], now
+            )
+        fresh = conn.execute(
+            "SELECT * FROM makeup_applications WHERE id = ?", (application["id"],)
+        ).fetchone()
+        result = _makeup_application_view(conn, fresh)
+        result["switched_from_session_id"] = (
+            switched_from["session_id"] if switched_from is not None else None
+        )
+        result["idempotent_replay"] = False
+        return _makeup_op_store(
+            conn, scope, op_id, request_hash, candidate_id, result, clock
+        )
+
+
+def withdraw_makeup_application(
+    db: Database,
+    exam_id: int,
+    application_id: int,
+    candidate_id: int,
+    op_id: str | None,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    """Candidate withdraws a waitlisted/invited application (退出候补)."""
+    with db.write() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        now = clock.now()
+        _settle_makeup_campaign_locked(conn, clock, campaign, now)
+        application = conn.execute(
+            "SELECT * FROM makeup_applications WHERE id = ? AND campaign_id = ?",
+            (application_id, campaign["id"]),
+        ).fetchone()
+        if application is None or application["candidate_id"] != candidate_id:
+            raise ServiceError(404, f"application {application_id} not found")
+        scope = f"makeup-withdraw:{application_id}"
+        replay, op_id, request_hash = _makeup_op_replay(
+            conn, scope, op_id, {"application_id": application_id}, candidate_id
+        )
+        if replay is not None:
+            return replay
+        if application["state"] not in _MAKEUP_ACTIVE_STATES:
+            raise ServiceError(
+                409,
+                f"application {application_id} is {application['state']};"
+                " only a waitlisted or invited application can be withdrawn",
+            )
+        now_iso = clock.now_iso()
+        if application["state"] == "invited":
+            conn.execute(
+                "UPDATE makeup_invitations SET status = 'cancelled', resolved_at = ?"
+                " WHERE application_id = ? AND status = 'pending'",
+                (now_iso, application_id),
+            )
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'cancelled', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, application_id),
+        )
+        if application["state"] == "invited":
+            # The held seat is released; promote the queue.
+            _promote_makeup_session_locked(
+                conn, clock, campaign, application["session_id"], now
+            )
+        fresh = conn.execute(
+            "SELECT * FROM makeup_applications WHERE id = ?", (application_id,)
+        ).fetchone()
+        result = _makeup_application_view(conn, fresh)
+        result["idempotent_replay"] = False
+        return _makeup_op_store(
+            conn, scope, op_id, request_hash, candidate_id, result, clock
+        )
+
+
+def unsubscribe_makeup(
+    db: Database,
+    exam_id: int,
+    candidate_id: int,
+    op_id: str | None,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    """Give up a confirmed seat before the exam starts (退订).
+
+    Releases the seat (promoting the queue) and cancels the candidate's own
+    waitlisted/invited application as well.
+    """
+    with db.write() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        now = clock.now()
+        _settle_makeup_campaign_locked(conn, clock, campaign, now)
+        scope = f"makeup-unsubscribe:{campaign['id']}:{candidate_id}"
+        replay, op_id, request_hash = _makeup_op_replay(
+            conn, scope, op_id, {}, candidate_id
+        )
+        if replay is not None:
+            return replay
+        confirmed = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? AND state = 'confirmed'",
+            (campaign["id"], candidate_id),
+        ).fetchone()
+        if confirmed is None:
+            completed = conn.execute(
+                "SELECT 1 FROM makeup_applications WHERE campaign_id = ?"
+                " AND candidate_id = ? AND state = 'completed'",
+                (campaign["id"], candidate_id),
+            ).fetchone()
+            if completed is not None:
+                raise ServiceError(
+                    409,
+                    "the makeup exam has already been started;"
+                    " unsubscribe is no longer possible",
+                )
+            raise ServiceError(409, "no confirmed seat to unsubscribe")
+
+        now_iso = clock.now_iso()
+        cancelled_ids = [confirmed["id"]]
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'cancelled', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, confirmed["id"]),
+        )
+        conn.execute(
+            "DELETE FROM exam_enrollments WHERE exam_id = ? AND candidate_id = ?",
+            (exam_id, candidate_id),
+        )
+        active = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? AND state IN ('waitlisted', 'invited')",
+            (campaign["id"], candidate_id),
+        ).fetchone()
+        if active is not None:
+            cancelled_ids.append(active["id"])
+            if active["state"] == "invited":
+                conn.execute(
+                    "UPDATE makeup_invitations SET status = 'cancelled',"
+                    " resolved_at = ? WHERE application_id = ? AND status = 'pending'",
+                    (now_iso, active["id"]),
+                )
+            conn.execute(
+                "UPDATE makeup_applications SET state = 'cancelled', updated_at = ?"
+                " WHERE id = ?",
+                (now_iso, active["id"]),
+            )
+        _promote_makeup_session_locked(
+            conn, clock, campaign, confirmed["session_id"], now
+        )
+        if active is not None and active["state"] == "invited":
+            _promote_makeup_session_locked(
+                conn, clock, campaign, active["session_id"], now
+            )
+        result = {
+            "exam_id": exam_id,
+            "campaign_id": campaign["id"],
+            "unsubscribed_application_id": confirmed["id"],
+            "released_session_id": confirmed["session_id"],
+            "cancelled_application_ids": cancelled_ids,
+            "idempotent_replay": False,
+        }
+        return _makeup_op_store(
+            conn, scope, op_id, request_hash, candidate_id, result, clock
+        )
+
+
+def get_my_makeup(
+    db: Database, exam_id: int, candidate_id: int, clock: Clock = _REAL_CLOCK
+) -> dict[str, Any]:
+    """Candidate view: own applications/invitations only, after settlement."""
+    _settle_makeup(db, exam_id, clock)
+    with db.read() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        eligible, total = _makeup_eligibility(conn, campaign, candidate_id)
+        view = _makeup_campaign_view(conn, campaign, include_applications=False)
+        view["my_eligibility"] = {
+            "eligible": eligible,
+            "published_total_score": total,
+            "pass_score": campaign["pass_score"],
+        }
+        rows = conn.execute(
+            "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+            " AND candidate_id = ? ORDER BY id DESC",
+            (campaign["id"], candidate_id),
+        ).fetchall()
+        view["my_applications"] = [_makeup_application_view(conn, r) for r in rows]
+        return view
+
+
+def get_makeup_for_staff(
+    db: Database, exam_id: int, clock: Clock = _REAL_CLOCK
+) -> dict[str, Any]:
+    """Staff view: full campaign with every application, after settlement."""
+    _settle_makeup(db, exam_id, clock)
+    with db.read() as conn:
+        campaign = _require_makeup_campaign(conn, exam_id)
+        return _makeup_campaign_view(conn, campaign, include_applications=True)
+
+
+def _makeup_on_exam_start(
+    conn, exam_id: int, candidate_id: int, clock: Clock
+) -> None:
+    """Finalize a candidate's reservation state on the first successful start.
+
+    Runs inside the attempt-creation transaction: the confirmed application
+    becomes completed (seat stays occupied) and any unfinished switch
+    application (waitlist/invitation) is cancelled, releasing a held seat.
+    """
+    campaign = _get_makeup_campaign(conn, exam_id)
+    if campaign is None:
+        return
+    now = clock.now()
+    _settle_makeup_campaign_locked(conn, clock, campaign, now)
+    now_iso = clock.now_iso()
+    active = conn.execute(
+        "SELECT * FROM makeup_applications WHERE campaign_id = ?"
+        " AND candidate_id = ? AND state IN ('waitlisted', 'invited')",
+        (campaign["id"], candidate_id),
+    ).fetchone()
+    released_session_id = None
+    if active is not None:
+        if active["state"] == "invited":
+            conn.execute(
+                "UPDATE makeup_invitations SET status = 'cancelled', resolved_at = ?"
+                " WHERE application_id = ? AND status = 'pending'",
+                (now_iso, active["id"]),
+            )
+            released_session_id = active["session_id"]
+        conn.execute(
+            "UPDATE makeup_applications SET state = 'cancelled', updated_at = ?"
+            " WHERE id = ?",
+            (now_iso, active["id"]),
+        )
+    conn.execute(
+        "UPDATE makeup_applications SET state = 'completed', updated_at = ?"
+        " WHERE campaign_id = ? AND candidate_id = ? AND state = 'confirmed'",
+        (now_iso, campaign["id"], candidate_id),
+    )
+    if released_session_id is not None:
+        _promote_makeup_session_locked(conn, clock, campaign, released_session_id, now)
+
+
+def _makeup_on_result_published(
+    conn, exam_id: int, candidate_id: int, clock: Clock
+) -> None:
+    """Void pending waitlists/invitations that lost eligibility via this publish."""
+    campaigns = conn.execute(
+        "SELECT * FROM makeup_campaigns WHERE basis_exam_id = ?", (exam_id,)
+    ).fetchall()
+    if not campaigns:
+        return
+    now = clock.now()
+    for campaign in campaigns:
+        _settle_makeup_campaign_locked(conn, clock, campaign, now)
 

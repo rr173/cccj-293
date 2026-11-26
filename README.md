@@ -9,6 +9,10 @@ Python + FastAPI + SQLite 实现的最小服务端能力，无前端、无复杂
 - **限时测评**：管理员把考生分入一个或多个**场次**，每人一个场次和独立答题时长；
   服务端计时，支持**场次级 / 考生级两层暂停与续考**，时间用尽由服务端惰性自动交卷。
 
+另支持**补考分场预约**：为尚未开考、未配置限时场次的测评开设一次补考预约，
+按另一份测评的已发布总分划定资格，考生自助申请场次、候补递补、邀请确认、
+换场与退订；确认后沿用限时场次的全部开考/暂停/计时规则。
+
 ## 运行
 
 ```bash
@@ -24,7 +28,10 @@ python3 -m venv .venv
 # 限时场次演示（进程内服务 + 可控虚拟时钟，零真实等待，同样全走 HTTP）
 .venv/bin/python scripts/demo_timed_http.py
 
-# 测试（含真实线程并发、幂等重试、冲突拒绝、重叠暂停、服务重启后惰性交卷、申诉结案/改分/发布竞争）
+# 补考分场预约演示（候补→确认→换场→到期→资格作废→开考锁定，全走 HTTP）
+.venv/bin/python scripts/demo_makeup_http.py
+
+# 测试（含真实线程并发、幂等重试、冲突拒绝、重叠暂停、服务重启后惰性交卷、申诉结案/改分/发布竞争、补考预约）
 .venv/bin/python -m pytest tests/ -v
 
 # 只跑单题成绩申诉的端到端 HTTP 验证
@@ -212,6 +219,72 @@ curl -u grader:grader-pass-123 \
 }
 ```
 
+## 补考分场预约 HTTP 用法
+
+管理员为一份**尚未开考、未配置限时场次**的测评开设**一次**补考预约：指定另一份
+测评作为资格依据、合格线、各补考场次的名称/答题时长/名额，以及邀请确认时限。
+**不预填考生名单**——资格完全由「原测评当前已发布总分 < 合格线」动态决定
+（未发布成绩不算）。开设后该测评变为限时测评，补考场次带名额；考生确认邀请后
+被写入名单，之后的开考、两层暂停、限时自动交卷完全沿用既有规则。
+
+| 步骤 | 方法与路径 | 角色 | 关键语义 |
+| --- | --- | --- | --- |
+| 开设补考预约 | `POST /admin/exams/{eid}/makeup` | admin | 带 `op_id`；body：`basis_exam_id/pass_score/invite_ttl_seconds/sessions[{name,duration_seconds,capacity}]`；已开考、已配置限时或已有补考预约时 `409` |
+| 管理员视图 | `GET /admin/exams/{eid}/makeup` | staff | 各场次名额占用与全部申请；查询前先惰性结算到期/资格/递补 |
+| 我的预约 | `GET /exams/{eid}/makeup` | candidate | 本人资格、各场次空位、本人申请与邀请；不含他人信息 |
+| 申请场次 | `POST /exams/{eid}/makeup/applications` | candidate | 带 `op_id` + `session_id`；有空位立即发邀请，否则按申请先后排队候补 |
+| 确认邀请 | `POST /exams/{eid}/makeup/invitations/{iid}/confirm` | candidate | 带 `op_id`；确认该场开考资格；已确认他场者确认新邀请即**原子换场**并释放原位 |
+| 退出候补 | `POST /exams/{eid}/makeup/applications/{aid}/withdraw` | candidate | 带 `op_id`；候补/被邀请状态可退，持有名额立即释放并递补 |
+| 退订座位 | `POST /exams/{eid}/makeup/unsubscribe` | candidate | 带 `op_id`；开考前退订释放座位，并同时取消本人的候补或邀请 |
+
+规则要点：
+
+- **一次只追一个场次**：同一考生在同一补考预约下最多一个进行中（候补/被邀请）
+  申请；已确认者只能候补**其他**场次，候补期间原位不丢，确认新邀请时才换场
+  （换场前两边各占一个名额）。
+- **邀请保留一个名额**：从实际发出时起算，确认时限内未确认则到期释放，该次申请
+  同时结束；每张邀请单独可识别，旧邀请不能确认新席位。服务离线期间照常到期，
+  不补发已过去的邀请；任何查询/办理都会先看到已处理的到期、资格变动与递补结果。
+- **资格变动即作废**：发布新版成绩后，失去资格者的候补与未确认邀请作废（已确认
+  座位不撤销）；即使后来恢复资格也须重新申请。申请与确认两个时点都校验资格。
+- **开考即锁定**：第一次成功开考后，未完成的换场申请取消，不能再退订或换场；
+  一次开考只认最终确认的场次，沿用该场的暂停与限时规则。
+- **幂等**：所有写操作带 `op_id`（或 `Idempotency-Key` 头）；同标识重放返回首次
+  结果且不再占用/释放/移动席位，同标识换请求返回 `409`。
+
+请求体示例：
+
+```json
+// POST /admin/exams/2/makeup
+{
+  "op_id": "mk-open-01",
+  "basis_exam_id": 1,
+  "pass_score": 5,
+  "invite_ttl_seconds": 300,
+  "sessions": [
+    {"name": "补考甲场", "duration_seconds": 600, "capacity": 1},
+    {"name": "补考乙场", "duration_seconds": 900, "capacity": 1}
+  ]
+}
+// POST /exams/2/makeup/applications
+{"op_id": "app-c1-01", "session_id": 3}
+```
+
+申请响应（有空位时直接获得邀请；否则 `state: "waitlisted"` 并给出 `queue_position`）：
+
+```json
+{
+  "application_id": 1, "session_id": 3, "session_name": "补考甲场",
+  "state": "invited", "queue_position": null,
+  "invitation": {"invitation_id": 1, "status": "pending",
+                 "issued_at": "...", "expires_at": "...", "resolved_at": null},
+  "idempotent_replay": false
+}
+```
+
+完整演示（候补→确认→换场→到期→资格作废→开考锁定）见
+`scripts/demo_makeup_http.py`，自动化验证见 `tests/test_makeup.py`。
+
 ## 关键不变量与实现位置
 
 1. **发卷即快照，题库后续编辑不影响已发卷。**
@@ -283,6 +356,22 @@ curl -u grader:grader-pass-123 \
     均在 `appeal_operations` 记录全局 `op_id` 与请求哈希；同请求重放不重复
     结案或生成结果，同 `op_id` 不同请求返回 `409`。结案、其他题改分和发布
     并发时，全局 `BEGIN IMMEDIATE` 事务序列化为一个一致先后顺序。
+19. **补考资格只认当前已发布总分，作废即时且不可复活。**
+    `makeup_campaigns` 每份测评至多一条（`UNIQUE(exam_id)`）；申请与确认时
+    都校验「原测评当前 published 总分 < 合格线」；`publish_result` 在同一
+    事务内调用结算，把失去资格者的候补/未确认邀请置为 `voided`（已确认座位
+    不动），恢复资格也只能重新申请。
+20. **名额由状态推导，邀请占座，换场原子。** 座位占用 = 该场次
+    `invited/confirmed/completed` 申请数（无冗余计数器，重启后不会超额）；
+    部分唯一索引保证每考生至多一个进行中申请和一个座位。确认新邀请时，旧
+    申请转 `switched`、名单改场、旧场递补在同一事务完成，不存在换场一半的
+    中间态。邀请自实际发出时占一个名额，到期（含服务离线期间）惰性置
+    `expired` 并结束该次申请，递补邀请以实际发出时刻重新计时。
+21. **开考定终局。** 首次成功开考（创建答卷）的同一事务内：已确认申请转
+    `completed`、未完成的换场申请取消并释放所持名额；此后退订/换场/新申请
+    一律 `409`。补考写操作（开设/申请/确认/退出/退订）均经
+    `makeup_operations` 记录 `op_id` 与请求哈希：重放返回首次结果、不再
+    占用/释放/移动席位，同 `op_id` 换请求返回 `409`。
 
 ## 数据模型概览（`exam_service/schema.py`）
 
@@ -302,6 +391,11 @@ score_appeals ──< appeal_assignments     # 单题申诉、冻结依据、两
 score_appeals ──< appeal_opinions        # 每人一次的复核意见（汇齐前保密）
 score_appeals ── appeal_rulings          # 一致结论或管理员仲裁的正式裁决
 appeal_operations                        # 开案/指派/复核/仲裁 op_id 幂等与请求哈希
+makeup_campaigns                         # 补考预约（每测评一次）：资格依据/合格线/确认时限
+exam_sessions.capacity                   # 补考场次名额（普通限时场次为 NULL）
+makeup_applications                      # 申请：候补/邀请/确认/完成 + 各终态
+makeup_invitations                       # 邀请：单独可识别，pending 期间占一个名额
+makeup_operations                        # 补考写操作 op_id 幂等与请求哈希
 ```
 
 限时相关字段集中在 `attempts`：`timed_mode / duration_seconds /

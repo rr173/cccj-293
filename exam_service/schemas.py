@@ -93,6 +93,42 @@ class ProctorActionIn(BaseModel):
     reason: Optional[str] = None
 
 
+# ---------- Makeup reservations (补考分场预约) ----------
+
+
+class MakeupSessionIn(BaseModel):
+    name: str = Field(min_length=1)
+    duration_seconds: int = Field(gt=0)
+    capacity: int = Field(gt=0, description="seat count (名额) of this makeup session")
+
+
+class MakeupCreateIn(BaseModel):
+    op_id: Optional[str] = Field(default=None, min_length=1)
+    basis_exam_id: int = Field(gt=0, description="exam whose published totals decide eligibility")
+    pass_score: int = Field(gt=0, description="eligible iff published total < pass_score")
+    invite_ttl_seconds: int = Field(gt=0, description="confirmation deadline of each invitation")
+    sessions: list[MakeupSessionIn] = Field(min_length=1)
+
+    @field_validator("sessions")
+    @classmethod
+    def _unique_session_names(cls, sessions: list[MakeupSessionIn]):
+        names = [s.name for s in sessions]
+        if len(names) != len(set(names)):
+            raise ValueError("session names must be unique")
+        return sessions
+
+
+class MakeupApplyIn(BaseModel):
+    op_id: Optional[str] = Field(default=None, min_length=1)
+    session_id: int = Field(gt=0)
+
+
+class MakeupOpIn(BaseModel):
+    """confirm / withdraw / unsubscribe carry only the idempotency key."""
+
+    op_id: Optional[str] = Field(default=None, min_length=1)
+
+
 # ---------- Answering ----------
 
 

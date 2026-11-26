@@ -18,6 +18,9 @@ from .schemas import (
     AppealCreateIn,
     AppealDecisionIn,
     ExamCreateIn,
+    MakeupApplyIn,
+    MakeupCreateIn,
+    MakeupOpIn,
     ManualScoreIn,
     ProctorActionIn,
     PublishIn,
@@ -42,10 +45,11 @@ def create_app(
 
     app = FastAPI(
         title="Exam Service",
-        version="1.1",
+        version="1.2",
         description="Issue -> answer -> grade -> publish, with snapshots,"
-        " optimistic revisions, idempotent submit, versioned results and"
-        " timed sessions with two-layer pause/resume.",
+        " optimistic revisions, idempotent submit, versioned results,"
+        " timed sessions with two-layer pause/resume, and makeup-session"
+        " reservations with waitlist, invitations and seat switches.",
     )
     authenticate = get_current_user_factory(db)
     require_roles = require_roles_factory(authenticate)
@@ -204,6 +208,89 @@ def create_app(
     @app.get("/admin/exams/{exam_id}/proctor-events")
     def list_proctor_events(exam_id: int, _: CurrentUser = Depends(staff)):
         return service.list_proctor_events(db, exam_id)
+
+    # ---------------- Makeup reservations (补考分场预约) ----------------
+
+    @app.post("/admin/exams/{exam_id}/makeup", status_code=201)
+    def create_makeup_campaign(
+        exam_id: int,
+        payload: MakeupCreateIn,
+        request: Request,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        body = service.create_makeup_campaign(
+            db,
+            exam_id,
+            _op_id(payload, request),
+            payload.basis_exam_id,
+            payload.pass_score,
+            payload.invite_ttl_seconds,
+            [s.model_dump() for s in payload.sessions],
+            user.id,
+            clock,
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.get("/admin/exams/{exam_id}/makeup")
+    def get_makeup_campaign_staff(exam_id: int, _: CurrentUser = Depends(staff)):
+        return service.get_makeup_for_staff(db, exam_id, clock)
+
+    @app.get("/exams/{exam_id}/makeup")
+    def get_my_makeup(exam_id: int, user: CurrentUser = Depends(candidate_only)):
+        return service.get_my_makeup(db, exam_id, user.id, clock)
+
+    @app.post("/exams/{exam_id}/makeup/applications", status_code=201)
+    def apply_makeup(
+        exam_id: int,
+        payload: MakeupApplyIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        body = service.apply_makeup(
+            db, exam_id, user.id, _op_id(payload, request), payload.session_id, clock
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.post("/exams/{exam_id}/makeup/invitations/{invitation_id}/confirm")
+    def confirm_makeup_invitation(
+        exam_id: int,
+        invitation_id: int,
+        payload: MakeupOpIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        return service.confirm_makeup_invitation(
+            db, exam_id, invitation_id, user.id, _op_id(payload, request), clock
+        )
+
+    @app.post("/exams/{exam_id}/makeup/applications/{application_id}/withdraw")
+    def withdraw_makeup_application(
+        exam_id: int,
+        application_id: int,
+        payload: MakeupOpIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        return service.withdraw_makeup_application(
+            db, exam_id, application_id, user.id, _op_id(payload, request), clock
+        )
+
+    @app.post("/exams/{exam_id}/makeup/unsubscribe")
+    def unsubscribe_makeup(
+        exam_id: int,
+        payload: MakeupOpIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        return service.unsubscribe_makeup(
+            db, exam_id, user.id, _op_id(payload, request), clock
+        )
 
     # ---------------- Candidate answering ----------------
 
