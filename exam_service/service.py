@@ -15,6 +15,7 @@ submitted the moment anyone looks at it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from datetime import datetime
@@ -1089,6 +1090,55 @@ def _latest_manual(conn, exam_id: int, candidate_id: int, question_id: int):
     ).fetchone()
 
 
+def _effective_appeal_ruling(
+    conn, exam_id: int, candidate_id: int, question_id: int
+):
+    """Permanent changed-score ruling for this exact answer sheet/question."""
+    return conn.execute(
+        "SELECT r.* FROM appeal_rulings r"
+        " JOIN score_appeals a ON a.final_ruling_id = r.id"
+        " WHERE a.exam_id = ? AND a.candidate_id = ? AND a.question_id = ?"
+        " AND a.status = 'closed_changed' AND r.decision = 'changed'"
+        " ORDER BY r.id DESC LIMIT 1",
+        (exam_id, candidate_id, question_id),
+    ).fetchone()
+
+
+def _ordinary_manual_blocker(
+    conn,
+    exam_id: int,
+    candidate_id: int,
+    question_id: int,
+    actor_id: int,
+):
+    """Return a 409 ServiceError if ordinary manual scoring is forbidden."""
+    ruling = _effective_appeal_ruling(
+        conn, exam_id, candidate_id, question_id
+    )
+    if ruling is not None:
+        return ServiceError(
+            409,
+            "question has a final appeal score ruling; ordinary manual scores"
+            " and revocations cannot override it",
+        )
+    assignment = conn.execute(
+        "SELECT a.id AS appeal_id FROM score_appeals a"
+        " JOIN appeal_assignments aa ON aa.appeal_id = a.id"
+        " WHERE a.exam_id = ? AND a.candidate_id = ? AND a.question_id = ?"
+        " AND aa.grader_id = ? AND a.status != 'closed_rejected'"
+        " AND a.status != 'closed_changed'"
+        " LIMIT 1",
+        (exam_id, candidate_id, question_id, actor_id),
+    ).fetchone()
+    if assignment is not None:
+        return ServiceError(
+            409,
+            "assigned appeal reviewers cannot use the ordinary manual-score"
+            " entry for this question before the appeal is closed",
+        )
+    return None
+
+
 def _auto_score_one(qtype: str, selected: list[str], correct: list[str], max_score: int) -> int:
     # Single and multi use the same all-or-nothing rule: exact set equality.
     if set(selected) == set(correct):
@@ -1150,28 +1200,65 @@ def _auto_grade(
         auto = _auto_score_one(eq["qtype"], selected, correct, eq["max_score"])
 
         manual_action = _latest_manual(conn, exam_id, candidate_id, qid)
+        manual_action_id = None
         manual_score = None
         manual_reason = None
         if manual_action is not None and manual_action["score"] is not None:
+            manual_action_id = manual_action["id"]
             manual_score = manual_action["score"]
             manual_reason = manual_action["reason"]
-        effective = auto if manual_score is None else manual_score
+
+        appeal_ruling = _effective_appeal_ruling(
+            conn, exam_id, candidate_id, qid
+        )
+        appeal_ruling_id = None
+        if manual_score is None:
+            effective = auto
+            source_type = "auto"
+            source_id = None
+        else:
+            effective = manual_score
+            source_type = "manual"
+            source_id = manual_action_id
+        if appeal_ruling is not None:
+            # A changed appeal ruling is permanent: regrades still apply it,
+            # and ordinary manual actions are rejected before insertion.
+            appeal_ruling_id = appeal_ruling["id"]
+            effective = appeal_ruling["final_score"]
+            source_type = "appeal_ruling"
+            source_id = appeal_ruling["id"]
         total += effective
 
         conn.execute(
             "INSERT INTO result_items"
-            " (result_version_id, question_id, auto_score, manual_score,"
-            "  manual_reason, effective_score)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (result_id, qid, auto, manual_score, manual_reason, effective),
+            " (result_version_id, question_id, auto_score, manual_action_id,"
+            "  manual_score, manual_reason, effective_score,"
+            "  appeal_ruling_id, score_source_type, score_source_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                result_id,
+                qid,
+                auto,
+                manual_action_id,
+                manual_score,
+                manual_reason,
+                effective,
+                appeal_ruling_id,
+                source_type,
+                source_id,
+            ),
         )
         items.append(
             {
                 "question_id": qid,
                 "auto_score": auto,
+                "manual_action_id": manual_action_id,
                 "manual_score": manual_score,
                 "manual_reason": manual_reason,
                 "effective_score": effective,
+                "appeal_ruling_id": appeal_ruling_id,
+                "score_source_type": source_type,
+                "score_source_id": source_id,
             }
         )
 
@@ -1304,6 +1391,11 @@ def set_manual_score(
         ).fetchone()
         if eq is None:
             raise ServiceError(422, f"question {question_id} is not on exam {exam_id}")
+        blocker = _ordinary_manual_blocker(
+            conn, exam_id, candidate_id, question_id, grader_id
+        )
+        if blocker is not None:
+            raise blocker
         if score is not None and score > eq["max_score"]:
             raise ServiceError(
                 422, f"manual score {score} exceeds question max_score {eq['max_score']}"
@@ -1350,8 +1442,12 @@ def list_result_versions(
 
 def _result_summary(conn, rv_row) -> dict[str, Any]:
     items = conn.execute(
-        "SELECT question_id, auto_score, manual_score, manual_reason, effective_score"
-        " FROM result_items WHERE result_version_id = ? ORDER BY question_id",
+        "SELECT ri.question_id, ri.auto_score, ri.manual_action_id, ri.manual_score,"
+        " ri.manual_reason, ri.effective_score, ri.appeal_ruling_id,"
+        " ri.score_source_type, ri.score_source_id, ar.appeal_id"
+        " FROM result_items ri"
+        " LEFT JOIN appeal_rulings ar ON ar.id = ri.appeal_ruling_id"
+        " WHERE ri.result_version_id = ? ORDER BY ri.question_id",
         (rv_row["id"],),
     ).fetchall()
     scheme = conn.execute(
@@ -1366,7 +1462,13 @@ def _result_summary(conn, rv_row) -> dict[str, Any]:
         "scheme_source": scheme["source"],
         "created_at": rv_row["created_at"],
         "published_at": rv_row["published_at"],
-        "items": [_row_to_dict(i) for i in items],
+        "items": [
+            {
+                **_row_to_dict(i),
+                "score_source": i["score_source_type"],
+            }
+            for i in items
+        ],
     }
 
 
@@ -1424,6 +1526,7 @@ def publish_result(
             " WHERE id = ?",
             (published_at, target["id"]),
         )
+        _mark_published_appeal_corrections(conn, target["id"], published_at)
         return _result_summary(
             conn,
             conn.execute(
@@ -1449,7 +1552,12 @@ def get_published_result(
 
 
 def get_grading_history(
-    db: Database, exam_id: int, candidate_id: int, clock: Clock = _REAL_CLOCK
+    db: Database,
+    exam_id: int,
+    candidate_id: int,
+    clock: Clock = _REAL_CLOCK,
+    viewer_id: int | None = None,
+    viewer_role: str = "admin",
 ) -> dict[str, Any]:
     _settle_candidate(db, exam_id, candidate_id, clock)
     with db.read() as conn:
@@ -1469,9 +1577,24 @@ def get_grading_history(
             " FROM grading_schemes WHERE exam_id = ? ORDER BY scheme_version",
             (exam_id,),
         ).fetchall()
+        appeal_rows = conn.execute(
+            "SELECT * FROM score_appeals WHERE exam_id = ? AND candidate_id = ?"
+            " ORDER BY id",
+            (exam_id, candidate_id),
+        ).fetchall()
+        appeals = [
+            _appeal_view(
+                conn,
+                row,
+                viewer_id=viewer_id,
+                viewer_role=viewer_role,
+            )
+            for row in appeal_rows
+        ]
         return {
             "grading_runs": [_row_to_dict(r) for r in runs],
             "manual_actions": [_row_to_dict(a) for a in actions],
+            "appeals": appeals,
             "grading_schemes": [
                 {
                     "scheme_version": s["scheme_version"],
@@ -1482,3 +1605,1126 @@ def get_grading_history(
                 for s in schemes
             ],
         }
+
+
+# =========================== Score appeals ===========================
+
+
+def _idempotency_record(
+    conn,
+    scope: str,
+    op_id: str | None,
+    request_payload: dict[str, Any],
+    actor_id: int,
+    clock: Clock,
+    *,
+    appeal_id: int | None = None,
+):
+    """Return an existing operation row, or insert this new operation.
+
+    A reused ``(scope, op_id)`` with a different canonical request is a 409.
+    The global write lock / SQLite write transaction makes check-then-insert
+    atomic for both threaded and restarted callers.
+    """
+    if not op_id or not str(op_id).strip():
+        raise ServiceError(422, "op_id is required for retry-safe operations")
+    op_id = str(op_id)
+    canonical = _dumps({"actor_id": actor_id, "request": request_payload})
+    request_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    global_row = conn.execute(
+        "SELECT * FROM appeal_operations WHERE op_id = ?", (op_id,)
+    ).fetchone()
+    if global_row is not None:
+        if global_row["scope"] != scope or global_row["request_hash"] != request_hash:
+            raise ServiceError(
+                409,
+                f"op_id '{op_id}' was already used for a different request;"
+                " use a new op_id for a new operation",
+            )
+        return global_row
+
+    row = conn.execute(
+        "SELECT * FROM appeal_operations WHERE scope = ? AND op_id = ?",
+        (scope, op_id),
+    ).fetchone()
+    if row is not None:
+        if row["request_hash"] != request_hash:
+            raise ServiceError(
+                409,
+                f"op_id '{op_id}' was already used for a different request;"
+                " use a new op_id for a new operation",
+            )
+        return row
+
+    conn.execute(
+        "INSERT INTO appeal_operations"
+        " (scope, op_id, request_hash, appeal_id, actor_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (scope, op_id, request_hash, appeal_id, actor_id, clock.now_iso()),
+    )
+    return None
+
+
+def _get_appeal(conn, appeal_id: int):
+    row = conn.execute(
+        "SELECT * FROM score_appeals WHERE id = ?", (appeal_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, f"appeal {appeal_id} not found")
+    return row
+
+
+def _appeal_status_label(row) -> str:
+    status = row["status"]
+    if status == "pending_assignment":
+        return "待管理员指定复核阅卷员"
+    if status == "in_review":
+        return "阅卷员复核中"
+    if status == "pending_arbitration":
+        return "复核意见分歧，待管理员仲裁"
+    if status == "closed_rejected":
+        return "已结案：驳回，成绩不变"
+    if status == "closed_changed":
+        if row["correction_published_at"]:
+            return "已结案：改分已发布"
+        return "已结案：改分待发布"
+    return status
+
+
+def _appeal_view(
+    conn,
+    row,
+    *,
+    viewer_id: int | None = None,
+    viewer_role: str | None = None,
+) -> dict[str, Any]:
+    a = _row_to_dict(row)
+    appeal_id = a["id"]
+    candidate = conn.execute(
+        "SELECT id, username, display_name FROM users WHERE id = ?",
+        (a["candidate_id"],),
+    ).fetchone()
+    exam = conn.execute(
+        "SELECT id, title FROM exams WHERE id = ?", (a["exam_id"],)
+    ).fetchone()
+
+    assignments = [
+        _row_to_dict(r)
+        for r in conn.execute(
+            "SELECT aa.id, aa.slot, aa.grader_id, aa.created_at,"
+            " u.username AS grader_username, u.display_name AS grader_name"
+            " FROM appeal_assignments aa JOIN users u ON u.id = aa.grader_id"
+            " WHERE aa.appeal_id = ? ORDER BY aa.slot",
+            (appeal_id,),
+        ).fetchall()
+    ]
+    all_opinions = [
+        _row_to_dict(r)
+        for r in conn.execute(
+            "SELECT o.id, o.grader_id, o.decision, o.new_score, o.reason,"
+            " o.created_at, u.username AS grader_username,"
+            " u.display_name AS grader_name"
+            " FROM appeal_opinions o JOIN users u ON u.id = o.grader_id"
+            " WHERE o.appeal_id = ? ORDER BY o.id",
+            (appeal_id,),
+        ).fetchall()
+    ]
+    is_assigned = any(x["grader_id"] == viewer_id for x in assignments)
+    opinions_complete = len(all_opinions) >= 2
+
+    if viewer_role == "candidate" or viewer_role is None:
+        visible_opinions: list[dict[str, Any]] = []
+    elif viewer_role == "admin":
+        visible_opinions = all_opinions
+    elif viewer_role == "grader":
+        if opinions_complete:
+            visible_opinions = all_opinions
+        elif is_assigned:
+            visible_opinions = [
+                o for o in all_opinions if o["grader_id"] == viewer_id
+            ]
+        else:
+            # Unassigned graders have no need to read sealed opinions while
+            # the two assigned reviewers are still working.
+            visible_opinions = []
+    else:
+        visible_opinions = []
+
+    own_opinion = next(
+        (o for o in all_opinions if o["grader_id"] == viewer_id), None
+    )
+    ruling = None
+    if a["final_ruling_id"] is not None:
+        rr = conn.execute(
+            "SELECT r.*, u.username AS decider_username"
+            " FROM appeal_rulings r LEFT JOIN users u ON u.id = r.decider_id"
+            " WHERE r.id = ?",
+            (a["final_ruling_id"],),
+        ).fetchone()
+        if rr is not None:
+            ruling = _row_to_dict(rr)
+
+    basis = _loads(a["basis_json"])
+    q_snapshot = basis.get("question", {})
+    public_question = {
+        k: q_snapshot.get(k)
+        for k in (
+            "question_id",
+            "version",
+            "qtype",
+            "stem",
+            "options",
+            "option_order",
+            "max_score",
+        )
+        if k in q_snapshot
+    }
+
+    correction: dict[str, Any] = {"status": "not_required"}
+    if a["final_decision"] == "changed" and ruling is not None:
+        published = conn.execute(
+            "SELECT rv.result_version, rv.published_at"
+            " FROM result_items ri"
+            " JOIN result_versions rv ON rv.id = ri.result_version_id"
+            " WHERE ri.appeal_ruling_id = ? AND rv.status = 'published'"
+            " ORDER BY rv.result_version DESC LIMIT 1",
+            (ruling["id"],),
+        ).fetchone()
+        if published is not None:
+            correction = {
+                "status": "published",
+                "result_version": a["correction_result_version"],
+                "generated_result_version": a["correction_result_version"],
+                "published_result_version": published["result_version"],
+                "published_at": published["published_at"],
+            }
+        else:
+            correction = {
+                "status": "pending_publication",
+                "result_version": a["correction_result_version"],
+                "generated_result_version": a["correction_result_version"],
+                "published_result_version": None,
+                "published_at": None,
+            }
+
+    coarse_phase = {
+        "pending_assignment": "pending",
+        "in_review": "reviewing",
+        "pending_arbitration": "arbitration",
+        "closed_rejected": "closed",
+        "closed_changed": "closed",
+    }[a["status"]]
+
+    out: dict[str, Any] = {
+        "appeal_id": appeal_id,
+        "id": appeal_id,
+        "exam_id": a["exam_id"],
+        "exam_title": exam["title"] if exam is not None else None,
+        "candidate_id": a["candidate_id"],
+        "candidate": _row_to_dict(candidate) if candidate is not None else None,
+        "question_id": a["question_id"],
+        "question": public_question,
+        "result_version": a["result_version"],
+        "appealed_result_version": a["result_version"],
+        "appealed_score": a["appealed_score"],
+        "reason": a["reason"],
+        "status": a["status"],
+        "state": a["status"],
+        "stage": a["status"],
+        "phase": coarse_phase,
+        "is_closed": a["status"].startswith("closed_"),
+        "status_label": _appeal_status_label(a),
+        "created_at": a["created_at"],
+        "assigned_at": a["assigned_at"],
+        "closed_at": a["closed_at"],
+        "assignments": assignments,
+        "opinions": visible_opinions,
+        "own_opinion": own_opinion
+        if viewer_role in ("grader", "admin") and own_opinion is not None
+        else None,
+        "opinions_received": len(all_opinions),
+        "opinions_complete": opinions_complete,
+        "is_assigned_reviewer": is_assigned,
+        "ruling": ruling if viewer_role != "candidate" else {
+            # Candidates receive the formal conclusion only, never reviewer
+            # opinion rows or internal basis data.
+            "kind": ruling["kind"] if ruling else None,
+            "decision": a["final_decision"],
+            "final_score": a["final_score"],
+            "reason": a["final_reason"],
+            "created_at": ruling["created_at"] if ruling else a["closed_at"],
+        }
+        if a["final_decision"] is not None
+        else None,
+        "conclusion": {
+            "decision": a["final_decision"],
+            "final_score": a["final_score"],
+            "reason": a["final_reason"],
+            "closure_kind": a["closure_kind"],
+            "closed_at": a["closed_at"],
+        }
+        if a["final_decision"] is not None
+        else None,
+        "closure": {
+            "decision": a["final_decision"],
+            "final_score": a["final_score"],
+            "reason": a["final_reason"],
+            "kind": a["closure_kind"],
+            "closed_at": a["closed_at"],
+        }
+        if a["final_decision"] is not None
+        else None,
+        "correction": correction,
+        "correction_status": correction["status"],
+        "correction_result_version": a["correction_result_version"],
+        "correction_published_at": a["correction_published_at"],
+        "final_decision": a["final_decision"],
+        "final_score": a["final_score"],
+    }
+    out["resolution"] = out["conclusion"]
+    out["score_correction"] = out["correction"]
+    out["score_change_status"] = out["correction_status"]
+
+    # Staff trace view gets the frozen full basis. Candidate output deliberately
+    # does not include it because it contains staff-only answer-key provenance.
+    if viewer_role in ("admin", "grader"):
+        out["basis"] = basis
+        out["arbitrator_id"] = a["arbitrator_id"]
+        if viewer_role == "admin":
+            out["all_opinions"] = all_opinions
+    return out
+
+
+def create_appeal(
+    db: Database,
+    exam_id: int,
+    candidate_id: int,
+    op_id: str | None,
+    result_version: int | None,
+    question_id: int,
+    reason: str,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    reason = (reason or "").strip()
+    if not reason:
+        raise ServiceError(422, "appeal reason is required")
+    with db.write() as conn:
+        if conn.execute(
+            "SELECT 1 FROM exams WHERE id = ?", (exam_id,)
+        ).fetchone() is None:
+            raise ServiceError(404, f"exam {exam_id} not found")
+
+        if result_version is None:
+            current_published = conn.execute(
+                "SELECT result_version FROM result_versions"
+                " WHERE exam_id = ? AND candidate_id = ? AND status = 'published'"
+                " ORDER BY result_version DESC LIMIT 1",
+                (exam_id, candidate_id),
+            ).fetchone()
+            if current_published is None:
+                raise ServiceError(409, "no current published result to appeal yet")
+            result_version = current_published["result_version"]
+
+        scope = f"appeal-open:{exam_id}:{candidate_id}"
+        idem = _idempotency_record(
+            conn,
+            scope,
+            op_id,
+            {
+                "path": f"/exams/{exam_id}/appeals",
+                "result_version": result_version,
+                "question_id": question_id,
+                "reason": reason,
+            },
+            candidate_id,
+            clock,
+        )
+        if idem is not None:
+            row = _get_appeal(conn, idem["appeal_id"])
+            view = _appeal_view(
+                conn, row, viewer_id=candidate_id, viewer_role="candidate"
+            )
+            view["idempotent_replay"] = True
+            view["note"] = "op_id already processed; appeal was not opened twice"
+            return view
+
+        published = conn.execute(
+            "SELECT * FROM result_versions"
+            " WHERE exam_id = ? AND candidate_id = ? AND result_version = ?"
+            " AND status = 'published'",
+            (exam_id, candidate_id, result_version),
+        ).fetchone()
+        if published is None:
+            # Tolerate callers that name the result row primary key in an
+            # optional *_id field rather than the candidate-visible version.
+            published = conn.execute(
+                "SELECT * FROM result_versions"
+                " WHERE exam_id = ? AND candidate_id = ? AND id = ?"
+                " AND status = 'published'",
+                (exam_id, candidate_id, result_version),
+            ).fetchone()
+        if published is None:
+            any_version = conn.execute(
+                "SELECT status FROM result_versions"
+                " WHERE exam_id = ? AND candidate_id = ? AND result_version = ?",
+                (exam_id, candidate_id, result_version),
+            ).fetchone()
+            if any_version is None:
+                raise ServiceError(
+                    404,
+                    f"published result version {result_version} not found",
+                )
+            raise ServiceError(
+                409,
+                "only the candidate's current published result may be appealed;"
+                f" version {result_version} has status {any_version['status']}",
+            )
+        result_version = published["result_version"]
+
+        item = conn.execute(
+            "SELECT * FROM result_items"
+            " WHERE result_version_id = ? AND question_id = ?",
+            (published["id"], question_id),
+        ).fetchone()
+        if item is None:
+            raise ServiceError(
+                422,
+                f"question {question_id} is not in result version {result_version}",
+            )
+        eq = conn.execute(
+            "SELECT * FROM exam_questions WHERE exam_id = ? AND question_id = ?",
+            (exam_id, question_id),
+        ).fetchone()
+        if eq is None:
+            raise ServiceError(
+                422, f"question {question_id} is not on exam {exam_id}"
+            )
+        attempt = conn.execute(
+            "SELECT * FROM attempts WHERE exam_id = ? AND candidate_id = ?",
+            (exam_id, candidate_id),
+        ).fetchone()
+        if attempt is None or attempt["status"] != "submitted":
+            raise ServiceError(409, "a submitted answer sheet is required")
+
+        duplicate = conn.execute(
+            "SELECT id FROM score_appeals"
+            " WHERE exam_id = ? AND candidate_id = ? AND question_id = ?",
+            (exam_id, candidate_id, question_id),
+        ).fetchone()
+        if duplicate is not None:
+            raise ServiceError(
+                409,
+                "this question on this answer sheet has already been appealed"
+                f" as appeal {duplicate['id']}; only one appeal is accepted",
+            )
+
+        scheme = conn.execute(
+            "SELECT * FROM grading_schemes WHERE id = ?",
+            (published["scheme_id"],),
+        ).fetchone()
+        answers = _loads(attempt["answers_json"])
+        q_key = str(question_id)
+        question_snapshot = _row_to_dict(eq)
+        question_snapshot["options"] = _loads(eq["options_json"])
+        question_snapshot["option_order"] = _loads(eq["option_order_json"])
+        basis = {
+            "appealed_at": clock.now_iso(),
+            "result_version": result_version,
+            "result_version_id": published["id"],
+            "result_item": _row_to_dict(item),
+            "question": question_snapshot,
+            "attempt_id": attempt["id"],
+            "attempt_revision": attempt["revision"],
+            "submitted_at": attempt["submitted_at"],
+            "submitted_answers": answers,
+            "selected_answer": answers.get(q_key, []),
+            "scheme": {
+                "id": scheme["id"],
+                "scheme_version": scheme["scheme_version"],
+                "answer_key": _loads(scheme["answer_key_json"]),
+                "source": scheme["source"],
+            }
+            if scheme is not None
+            else None,
+        }
+
+        cur = conn.execute(
+            "INSERT INTO score_appeals"
+            " (exam_id, candidate_id, attempt_id, result_version_id,"
+            "  result_version, question_id, appealed_score, reason, basis_json,"
+            "  status, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_assignment', ?)",
+            (
+                exam_id,
+                candidate_id,
+                attempt["id"],
+                published["id"],
+                result_version,
+                question_id,
+                item["effective_score"],
+                reason,
+                _dumps(basis),
+                clock.now_iso(),
+            ),
+        )
+        appeal_id = cur.lastrowid
+        conn.execute(
+            "UPDATE appeal_operations SET appeal_id = ?"
+            " WHERE scope = ? AND op_id = ?",
+            (
+                appeal_id,
+                scope,
+                op_id,
+            ),
+        )
+        row = _get_appeal(conn, appeal_id)
+        return _appeal_view(
+            conn, row, viewer_id=candidate_id, viewer_role="candidate"
+        )
+
+
+def get_appeal_for_candidate(
+    db: Database, exam_id: int, appeal_id: int, candidate_id: int
+):
+    with db.read() as conn:
+        row = _get_appeal(conn, appeal_id)
+        if row["exam_id"] != exam_id or row["candidate_id"] != candidate_id:
+            # Do not reveal whether an id belonging to another candidate exists.
+            raise ServiceError(404, f"appeal {appeal_id} not found")
+        return _appeal_view(
+            conn, row, viewer_id=candidate_id, viewer_role="candidate"
+        )
+
+
+def get_my_appeal(db: Database, appeal_id: int, candidate_id: int):
+    with db.read() as conn:
+        row = _get_appeal(conn, appeal_id)
+        if row["candidate_id"] != candidate_id:
+            raise ServiceError(404, f"appeal {appeal_id} not found")
+        return _appeal_view(
+            conn, row, viewer_id=candidate_id, viewer_role="candidate"
+        )
+
+
+def list_candidate_appeals(
+    db: Database, exam_id: int | None, candidate_id: int
+) -> dict[str, Any]:
+    with db.read() as conn:
+        if exam_id is None:
+            rows = conn.execute(
+                "SELECT * FROM score_appeals WHERE candidate_id = ?"
+                " ORDER BY id DESC",
+                (candidate_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM score_appeals WHERE candidate_id = ? AND exam_id = ?"
+                " ORDER BY id DESC",
+                (candidate_id, exam_id),
+            ).fetchall()
+        return {
+            "appeals": [
+                _appeal_view(
+                    conn, r, viewer_id=candidate_id, viewer_role="candidate"
+                )
+                for r in rows
+            ]
+        }
+
+
+def get_appeal_for_staff(
+    db: Database, appeal_id: int, user_id: int, role: str
+) -> dict[str, Any]:
+    with db.read() as conn:
+        row = _get_appeal(conn, appeal_id)
+        return _appeal_view(
+            conn, row, viewer_id=user_id, viewer_role=role
+        )
+
+
+def list_staff_appeals(
+    db: Database,
+    viewer_id: int,
+    viewer_role: str,
+    *,
+    exam_id: int | None = None,
+    candidate_id: int | None = None,
+    status: str | None = None,
+    assigned_to_me: bool = False,
+) -> dict[str, Any]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if exam_id is not None:
+        clauses.append("a.exam_id = ?")
+        params.append(exam_id)
+    if candidate_id is not None:
+        clauses.append("a.candidate_id = ?")
+        params.append(candidate_id)
+    if status is not None:
+        clauses.append("a.status = ?")
+        params.append(status)
+    if assigned_to_me:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM appeal_assignments aa"
+            " WHERE aa.appeal_id = a.id AND aa.grader_id = ?)"
+        )
+        params.append(viewer_id)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db.read() as conn:
+        rows = conn.execute(
+            f"SELECT a.* FROM score_appeals a{where} ORDER BY a.id DESC",
+            params,
+        ).fetchall()
+        return {
+            "appeals": [
+                _appeal_view(
+                    conn, r, viewer_id=viewer_id, viewer_role=viewer_role
+                )
+                for r in rows
+            ]
+        }
+
+
+def _resolve_grader_refs(
+    conn, refs: list[Any], ids: list[int] | None = None
+) -> list[int]:
+    resolved: list[int] = []
+    for gid in ids or []:
+        row = conn.execute(
+            "SELECT id, role FROM users WHERE id = ?", (gid,)
+        ).fetchone()
+        if row is None:
+            raise ServiceError(422, f"grader user id {gid} not found")
+        if row["role"] != "grader":
+            raise ServiceError(422, f"user id {gid} is not a grader")
+        resolved.append(row["id"])
+
+    for ref in refs or []:
+        if isinstance(ref, int):
+            row = conn.execute(
+                "SELECT id, role FROM users WHERE id = ?", (ref,)
+            ).fetchone()
+        else:
+            text = str(ref).strip()
+            row = conn.execute(
+                "SELECT id, role FROM users WHERE username = ?", (text,)
+            ).fetchone()
+            if row is None and text.isdigit():
+                row = conn.execute(
+                    "SELECT id, role FROM users WHERE id = ?", (int(text),)
+                ).fetchone()
+        if row is None:
+            raise ServiceError(422, f"grader '{ref}' not found")
+        if row["role"] != "grader":
+            raise ServiceError(422, f"user '{ref}' is not a grader")
+        resolved.append(row["id"])
+
+    if len(resolved) != 2:
+        raise ServiceError(
+            422,
+            "exactly two different graders must be assigned in one assignment"
+            f" action; received {len(resolved)}",
+        )
+    if len(set(resolved)) != 2:
+        raise ServiceError(422, "the two assigned graders must be different users")
+    return resolved
+
+
+def _manual_conflict_user(conn, appeal, grader_id: int):
+    return conn.execute(
+        "SELECT m.*, u.username FROM manual_score_actions m"
+        " JOIN users u ON u.id = m.grader_id"
+        " WHERE m.exam_id = ? AND m.candidate_id = ? AND m.question_id = ?"
+        " AND m.grader_id = ? LIMIT 1",
+        (
+            appeal["exam_id"],
+            appeal["candidate_id"],
+            appeal["question_id"],
+            grader_id,
+        ),
+    ).fetchone()
+
+
+def assign_appeal(
+    db: Database,
+    appeal_id: int,
+    op_id: str | None,
+    grader_refs: list[Any] | None,
+    grader_ids: list[int] | None,
+    admin_id: int,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    with db.write() as conn:
+        appeal = _get_appeal(conn, appeal_id)
+        scope = f"appeal-assign:{appeal_id}"
+        refs = list(grader_refs or [])
+        ids = list(grader_ids or [])
+        idem = _idempotency_record(
+            conn,
+            scope,
+            op_id,
+            {"grader_refs": refs, "grader_ids": ids},
+            admin_id,
+            clock,
+            appeal_id=appeal_id,
+        )
+        if idem is not None:
+            view = _appeal_view(
+                conn, appeal, viewer_id=admin_id, viewer_role="admin"
+            )
+            view["idempotent_replay"] = True
+            return view
+
+        if appeal["status"] != "pending_assignment":
+            raise ServiceError(
+                409,
+                f"appeal {appeal_id} is already {appeal['status']};"
+                " graders can only be assigned once before review starts",
+            )
+        grader_ids_resolved = _resolve_grader_refs(conn, refs, ids)
+        for gid in grader_ids_resolved:
+            conflict = _manual_conflict_user(conn, appeal, gid)
+            if conflict is not None:
+                raise ServiceError(
+                    409,
+                    f"grader '{conflict['username']}' previously gave an ordinary"
+                    " manual score or revoked a score for this candidate and"
+                    " question, and cannot review or arbitrate this appeal",
+                )
+
+        now = clock.now_iso()
+        for slot, gid in enumerate(grader_ids_resolved, start=1):
+            conn.execute(
+                "INSERT INTO appeal_assignments"
+                " (appeal_id, grader_id, slot, assigned_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (appeal_id, gid, slot, admin_id, now),
+            )
+        conn.execute(
+            "UPDATE score_appeals SET status = 'in_review', assigned_at = ?"
+            " WHERE id = ?",
+            (now, appeal_id),
+        )
+        fresh = _get_appeal(conn, appeal_id)
+        return _appeal_view(
+            conn, fresh, viewer_id=admin_id, viewer_role="admin"
+        )
+
+
+def _validate_decision_score(
+    conn, appeal, decision: str, new_score: int | None
+) -> int | None:
+    if decision == "rejected":
+        return None
+    if new_score is None:
+        raise ServiceError(
+            422, "a changed-score conclusion requires an integer new_score"
+        )
+    try:
+        score = int(new_score)
+    except (TypeError, ValueError):
+        raise ServiceError(422, "new_score must be an integer")
+    basis = _loads(appeal["basis_json"])
+    max_score = basis.get("question", {}).get("max_score")
+    if max_score is None:
+        eq = conn.execute(
+            "SELECT max_score FROM exam_questions"
+            " WHERE exam_id = ? AND question_id = ?",
+            (appeal["exam_id"], appeal["question_id"]),
+        ).fetchone()
+        max_score = eq["max_score"] if eq is not None else None
+    if max_score is None or score < 0 or score > max_score:
+        raise ServiceError(
+            422,
+            f"new_score must be an integer in [0, {max_score}] for the original question",
+        )
+    if score == appeal["appealed_score"]:
+        raise ServiceError(
+            422,
+            f"new_score {score} must differ from the appealed score"
+            f" {appeal['appealed_score']}",
+        )
+    return score
+
+
+def _create_appeal_correction_version(
+    conn, appeal, ruling_id: int, final_score: int, now_iso: str
+) -> Any:
+    existing_vid = appeal["correction_result_version_id"]
+    if existing_vid is not None:
+        return conn.execute(
+            "SELECT * FROM result_versions WHERE id = ?", (existing_vid,)
+        ).fetchone()
+
+    latest = conn.execute(
+        "SELECT * FROM result_versions"
+        " WHERE exam_id = ? AND candidate_id = ?"
+        " ORDER BY result_version DESC LIMIT 1",
+        (appeal["exam_id"], appeal["candidate_id"]),
+    ).fetchone()
+    if latest is None:
+        raise ServiceError(409, "cannot create correction without a result version")
+
+    next_v = conn.execute(
+        "SELECT COALESCE(MAX(result_version), 0) + 1 AS v FROM result_versions"
+        " WHERE exam_id = ? AND candidate_id = ?",
+        (appeal["exam_id"], appeal["candidate_id"]),
+    ).fetchone()["v"]
+    cur = conn.execute(
+        "INSERT INTO result_versions"
+        " (exam_id, candidate_id, result_version, status, total_score,"
+        "  scheme_id, created_at)"
+        " VALUES (?, ?, ?, 'pending', 0, ?, ?)",
+        (
+            appeal["exam_id"],
+            appeal["candidate_id"],
+            next_v,
+            latest["scheme_id"],  # Errata not yet regraded do not take effect.
+            now_iso,
+        ),
+    )
+    new_id = cur.lastrowid
+
+    old_items = conn.execute(
+        "SELECT * FROM result_items WHERE result_version_id = ? ORDER BY id",
+        (latest["id"],),
+    ).fetchall()
+    total = 0
+    target_found = False
+    for old in old_items:
+        qid = old["question_id"]
+        effective = old["effective_score"]
+        appeal_ruling_id = old["appeal_ruling_id"]
+        source_type = old["score_source_type"] or "auto"
+        source_id = old["score_source_id"]
+        if qid == appeal["question_id"]:
+            target_found = True
+            effective = final_score
+            appeal_ruling_id = ruling_id
+            source_type = "appeal_ruling"
+            source_id = ruling_id
+        total += effective
+        conn.execute(
+            "INSERT INTO result_items"
+            " (result_version_id, question_id, auto_score, manual_action_id,"
+            "  manual_score, manual_reason, effective_score,"
+            "  appeal_ruling_id, score_source_type, score_source_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id,
+                qid,
+                old["auto_score"],
+                old["manual_action_id"],
+                old["manual_score"],
+                old["manual_reason"],
+                effective,
+                appeal_ruling_id,
+                source_type,
+                source_id,
+            ),
+        )
+    if not target_found:
+        raise ServiceError(
+            409, "latest result version does not contain the appealed question"
+        )
+    conn.execute(
+        "UPDATE result_versions SET total_score = ? WHERE id = ?",
+        (total, new_id),
+    )
+    conn.execute(
+        "INSERT INTO grading_runs"
+        " (exam_id, candidate_id, scheme_id, trigger, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (
+            appeal["exam_id"],
+            appeal["candidate_id"],
+            latest["scheme_id"],
+            f"appeal ruling {ruling_id}: replace question"
+            f" {appeal['question_id']} score with {final_score}",
+            now_iso,
+        ),
+    )
+    return conn.execute(
+        "SELECT * FROM result_versions WHERE id = ?", (new_id,)
+    ).fetchone()
+
+
+def _close_appeal(
+    conn,
+    appeal,
+    *,
+    decision: str,
+    final_score: int | None,
+    reason: str,
+    kind: str,
+    decider_id: int | None,
+    clock: Clock,
+):
+    now = clock.now_iso()
+    cur = conn.execute(
+        "INSERT INTO appeal_rulings"
+        " (appeal_id, kind, decision, final_score, reason, decider_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (appeal["id"], kind, decision, final_score, reason, decider_id, now),
+    )
+    ruling_id = cur.lastrowid
+    correction = None
+    correction_v = None
+    if decision == "changed":
+        correction = _create_appeal_correction_version(
+            conn, appeal, ruling_id, final_score, now
+        )
+        correction_v = correction["result_version"]
+        conn.execute(
+            "UPDATE appeal_rulings SET result_version_id = ? WHERE id = ?",
+            (correction["id"], ruling_id),
+        )
+
+    status = "closed_rejected" if decision == "rejected" else "closed_changed"
+    conn.execute(
+        "UPDATE score_appeals"
+        " SET status = ?, final_decision = ?, final_score = ?,"
+        "     final_reason = ?, closure_kind = ?, final_ruling_id = ?,"
+        "     arbitrator_id = ?, closed_at = ?,"
+        "     correction_result_version_id = ?,"
+        "     correction_result_version = ?"
+        " WHERE id = ?",
+        (
+            status,
+            decision,
+            final_score,
+            reason,
+            kind,
+            ruling_id,
+            decider_id if kind == "arbitration" else None,
+            now,
+            correction["id"] if correction is not None else None,
+            correction_v,
+            appeal["id"],
+        ),
+    )
+    return ruling_id
+
+
+def submit_appeal_opinion(
+    db: Database,
+    appeal_id: int,
+    grader_id: int,
+    op_id: str | None,
+    decision_raw: str,
+    new_score_raw: int | None,
+    reason: str,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    reason = (reason or "").strip()
+    if not reason:
+        raise ServiceError(422, "opinion reason is required")
+    decision = str(decision_raw)
+    with db.write() as conn:
+        appeal = _get_appeal(conn, appeal_id)
+        scope = f"appeal-opinion:{appeal_id}:{grader_id}"
+        idem = _idempotency_record(
+            conn,
+            scope,
+            op_id,
+            {
+                "decision": decision,
+                "new_score": new_score_raw,
+                "reason": reason,
+            },
+            grader_id,
+            clock,
+            appeal_id=appeal_id,
+        )
+        if idem is not None:
+            fresh = _get_appeal(conn, appeal_id)
+            view = _appeal_view(
+                conn, fresh, viewer_id=grader_id, viewer_role="grader"
+            )
+            view["idempotent_replay"] = True
+            return view
+
+        assignment = conn.execute(
+            "SELECT 1 FROM appeal_assignments"
+            " WHERE appeal_id = ? AND grader_id = ?",
+            (appeal_id, grader_id),
+        ).fetchone()
+        if assignment is None:
+            raise ServiceError(
+                403, "only the two graders assigned to this appeal may submit opinions"
+            )
+        conflict = _manual_conflict_user(conn, appeal, grader_id)
+        if conflict is not None:
+            raise ServiceError(
+                403,
+                "a grader who previously manually scored or revoked this question"
+                " cannot review it",
+            )
+        if appeal["status"] not in ("in_review",):
+            raise ServiceError(
+                409,
+                f"appeal {appeal_id} is {appeal['status']}; opinions are no longer accepted",
+            )
+        existing = conn.execute(
+            "SELECT id FROM appeal_opinions WHERE appeal_id = ? AND grader_id = ?",
+            (appeal_id, grader_id),
+        ).fetchone()
+        if existing is not None:
+            raise ServiceError(409, "each assigned grader may submit only one opinion")
+
+        final_score = _validate_decision_score(
+            conn, appeal, decision, new_score_raw
+        )
+        conn.execute(
+            "INSERT INTO appeal_opinions"
+            " (appeal_id, grader_id, decision, new_score, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                appeal_id,
+                grader_id,
+                decision,
+                final_score,
+                reason,
+                clock.now_iso(),
+            ),
+        )
+
+        opinions = conn.execute(
+            "SELECT * FROM appeal_opinions WHERE appeal_id = ? ORDER BY id",
+            (appeal_id,),
+        ).fetchall()
+        if len(opinions) == 2:
+            first, second = opinions[0], opinions[1]
+            same = first["decision"] == second["decision"] and (
+                first["decision"] == "rejected"
+                or first["new_score"] == second["new_score"]
+            )
+            if same:
+                if first["decision"] == "rejected":
+                    formal_reason = "两名指派阅卷员结论一致：驳回申诉，维持该版得分。"
+                    _close_appeal(
+                        conn,
+                        appeal,
+                        decision="rejected",
+                        final_score=None,
+                        reason=formal_reason,
+                        kind="reviewer_agreement",
+                        decider_id=None,
+                        clock=clock,
+                    )
+                else:
+                    score = first["new_score"]
+                    formal_reason = (
+                        f"两名指派阅卷员结论一致：将该题分数改为 {score} 分。"
+                    )
+                    _close_appeal(
+                        conn,
+                        appeal,
+                        decision="changed",
+                        final_score=score,
+                        reason=formal_reason,
+                        kind="reviewer_agreement",
+                        decider_id=None,
+                        clock=clock,
+                    )
+            else:
+                conn.execute(
+                    "UPDATE score_appeals SET status = 'pending_arbitration'"
+                    " WHERE id = ?",
+                    (appeal_id,),
+                )
+
+        fresh = _get_appeal(conn, appeal_id)
+        return _appeal_view(
+            conn, fresh, viewer_id=grader_id, viewer_role="grader"
+        )
+
+
+def arbitrate_appeal(
+    db: Database,
+    appeal_id: int,
+    admin_id: int,
+    op_id: str | None,
+    decision_raw: str,
+    new_score_raw: int | None,
+    reason: str,
+    clock: Clock = _REAL_CLOCK,
+) -> dict[str, Any]:
+    reason = (reason or "").strip()
+    if not reason:
+        raise ServiceError(422, "arbitration reason is required")
+    decision = str(decision_raw)
+    with db.write() as conn:
+        appeal = _get_appeal(conn, appeal_id)
+        scope = f"appeal-arbitrate:{appeal_id}"
+        idem = _idempotency_record(
+            conn,
+            scope,
+            op_id,
+            {
+                "decision": decision,
+                "new_score": new_score_raw,
+                "reason": reason,
+            },
+            admin_id,
+            clock,
+            appeal_id=appeal_id,
+        )
+        if idem is not None:
+            fresh = _get_appeal(conn, appeal_id)
+            view = _appeal_view(
+                conn, fresh, viewer_id=admin_id, viewer_role="admin"
+            )
+            view["idempotent_replay"] = True
+            return view
+
+        conflict = _manual_conflict_user(conn, appeal, admin_id)
+        if conflict is not None:
+            raise ServiceError(
+                403,
+                "an administrator who previously manually scored or revoked this"
+                " question cannot arbitrate this appeal",
+            )
+        if appeal["status"] != "pending_arbitration":
+            raise ServiceError(
+                409,
+                f"appeal {appeal_id} is {appeal['status']}; arbitration is allowed"
+                " only after the two reviewers disagree",
+            )
+        final_score = _validate_decision_score(
+            conn, appeal, decision, new_score_raw
+        )
+        _close_appeal(
+            conn,
+            appeal,
+            decision=decision,
+            final_score=final_score,
+            reason=reason,
+            kind="arbitration",
+            decider_id=admin_id,
+            clock=clock,
+        )
+        fresh = _get_appeal(conn, appeal_id)
+        return _appeal_view(
+            conn, fresh, viewer_id=admin_id, viewer_role="admin"
+        )
+
+
+def _mark_published_appeal_corrections(
+    conn, result_version_id: int, published_at: str
+) -> None:
+    ruling_ids = [
+        r["appeal_ruling_id"]
+        for r in conn.execute(
+            "SELECT DISTINCT appeal_ruling_id FROM result_items"
+            " WHERE result_version_id = ? AND appeal_ruling_id IS NOT NULL",
+            (result_version_id,),
+        ).fetchall()
+    ]
+    for ruling_id in ruling_ids:
+        conn.execute(
+            "UPDATE score_appeals SET correction_published_at = ?"
+            " WHERE final_ruling_id = ? AND correction_published_at IS NULL",
+            (published_at, ruling_id),
+        )
+

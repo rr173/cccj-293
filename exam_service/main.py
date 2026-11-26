@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -14,6 +14,9 @@ from .db import Database
 from .schemas import (
     AnswerKeyEditIn,
     AnswerSaveIn,
+    AppealAssignIn,
+    AppealCreateIn,
+    AppealDecisionIn,
     ExamCreateIn,
     ManualScoreIn,
     ProctorActionIn,
@@ -64,6 +67,29 @@ def create_app(
         if row["role"] != "candidate":
             raise service.ServiceError(422, f"user '{username}' is not a candidate")
         return {"id": row["id"], "username": row["username"], "display_name": row["display_name"]}
+
+    def _op_id(payload: Any, request: Request) -> str:
+        value = getattr(payload, "op_id", None)
+        if not value:
+            value = request.headers.get("Idempotency-Key") or request.headers.get("X-Op-Id")
+        if not value or not str(value).strip():
+            raise service.ServiceError(
+                422, "op_id is required in the JSON body or Idempotency-Key header"
+            )
+        return str(value)
+
+    def _decision_fields(payload: AppealDecisionIn):
+        try:
+            return payload.decision_value(), payload.score_value(), payload.reason_value()
+        except ValueError as exc:
+            raise service.ServiceError(422, str(exc))
+
+    def _check_appeal_exam(appeal_id: int, exam_id: int | None, user: CurrentUser):
+        if exam_id is None:
+            return
+        current = service.get_appeal_for_staff(db, appeal_id, user.id, user.role)
+        if current["exam_id"] != exam_id:
+            raise service.ServiceError(404, f"appeal {appeal_id} not found in exam {exam_id}")
 
     # ---------------- health / identity ----------------
 
@@ -213,6 +239,160 @@ def create_app(
     def get_my_result(exam_id: int, user: CurrentUser = Depends(candidate_only)):
         return service.get_published_result(db, exam_id, user.id, clock)
 
+    # ---------------- Candidate score appeals ----------------
+
+    @app.post("/exams/{exam_id}/appeals", status_code=201)
+    @app.post("/exams/{exam_id}/appeal", status_code=201)
+    @app.post("/exams/{exam_id}/result/appeals", status_code=201)
+    @app.post("/exams/{exam_id}/result/appeal", status_code=201)
+    def create_my_appeal(
+        exam_id: int,
+        payload: AppealCreateIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        try:
+            result_version = payload.optional_version_value()
+            question_id = payload.question_id_value()
+            reason = payload.reason_value()
+        except ValueError as exc:
+            raise service.ServiceError(422, str(exc))
+        op_id = _op_id(payload, request)
+        body = service.create_appeal(
+            db,
+            exam_id,
+            user.id,
+            op_id,
+            result_version,
+            question_id,
+            reason,
+            clock,
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.post("/exams/{exam_id}/results/{result_version}/appeals", status_code=201)
+    def create_my_appeal_for_version(
+        exam_id: int,
+        result_version: int,
+        payload: AppealCreateIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        try:
+            question_id = payload.question_id_value()
+            reason = payload.reason_value()
+        except ValueError as exc:
+            raise service.ServiceError(422, str(exc))
+        body = service.create_appeal(
+            db,
+            exam_id,
+            user.id,
+            _op_id(payload, request),
+            result_version,
+            question_id,
+            reason,
+            clock,
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.post(
+        "/exams/{exam_id}/results/{result_version}/questions/{question_id}/appeal",
+        status_code=201,
+    )
+    def create_my_question_appeal(
+        exam_id: int,
+        result_version: int,
+        question_id: int,
+        payload: AppealCreateIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        try:
+            reason = payload.reason_value()
+        except ValueError as exc:
+            raise service.ServiceError(422, str(exc))
+        body = service.create_appeal(
+            db,
+            exam_id,
+            user.id,
+            _op_id(payload, request),
+            result_version,
+            question_id,
+            reason,
+            clock,
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.get("/exams/{exam_id}/appeals")
+    def list_my_exam_appeals(
+        exam_id: int, user: CurrentUser = Depends(candidate_only)
+    ):
+        return service.list_candidate_appeals(db, exam_id, user.id)
+
+    @app.get("/exams/{exam_id}/appeals/{appeal_id}")
+    def get_my_exam_appeal(
+        exam_id: int,
+        appeal_id: int,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        return service.get_appeal_for_candidate(db, exam_id, appeal_id, user.id)
+
+    @app.get("/my/appeals")
+    def list_all_my_appeals(user: CurrentUser = Depends(candidate_only)):
+        return service.list_candidate_appeals(db, None, user.id)
+
+    @app.get("/appeals/mine")
+    def list_all_my_appeals_alias(user: CurrentUser = Depends(candidate_only)):
+        return service.list_candidate_appeals(db, None, user.id)
+
+    @app.post("/appeals", status_code=201)
+    def create_my_appeal_top_level(
+        payload: AppealCreateIn,
+        request: Request,
+        user: CurrentUser = Depends(candidate_only),
+    ):
+        exam_id = payload.exam_id or payload.first_value("exam", "examId")
+        if exam_id is None:
+            raise service.ServiceError(422, "exam_id is required")
+        try:
+            result_version = payload.optional_version_value()
+            question_id = payload.question_id_value()
+            reason = payload.reason_value()
+        except ValueError as exc:
+            raise service.ServiceError(422, str(exc))
+        body = service.create_appeal(
+            db,
+            int(exam_id),
+            user.id,
+            _op_id(payload, request),
+            result_version,
+            question_id,
+            reason,
+            clock,
+        )
+        return JSONResponse(
+            status_code=200 if body.get("idempotent_replay") else 201,
+            content=body,
+        )
+
+    @app.get("/appeals/{appeal_id}")
+    def get_appeal_role_aware(
+        appeal_id: int,
+        user: CurrentUser = Depends(authenticate),
+    ):
+        if user.role == "candidate":
+            return service.get_my_appeal(db, appeal_id, user.id)
+        return service.get_appeal_for_staff(db, appeal_id, user.id, user.role)
+
     # ---------------- Grading (staff) ----------------
 
     @app.post("/admin/exams/{exam_id}/answer-key")
@@ -266,6 +446,165 @@ def create_app(
             clock,
         )
 
+    # ---------------- Score appeals: staff workflow ----------------
+
+    @app.get("/grading/appeals")
+    def list_all_appeals(
+        username: str | None = None,
+        exam_id: int | None = None,
+        status: str | None = None,
+        mine: bool = False,
+        user: CurrentUser = Depends(staff),
+    ):
+        candidate_id = None
+        if username is not None:
+            with db.read() as conn:
+                candidate_id = _resolve_candidate(conn, username)["id"]
+        return service.list_staff_appeals(
+            db,
+            user.id,
+            user.role,
+            exam_id=exam_id,
+            candidate_id=candidate_id,
+            status=status,
+            assigned_to_me=mine and user.role == "grader",
+        )
+
+    @app.get("/admin/appeals")
+    def list_all_appeals_admin(
+        username: str | None = None,
+        exam_id: int | None = None,
+        status: str | None = None,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        candidate_id = None
+        if username is not None:
+            with db.read() as conn:
+                candidate_id = _resolve_candidate(conn, username)["id"]
+        return service.list_staff_appeals(
+            db,
+            user.id,
+            user.role,
+            exam_id=exam_id,
+            candidate_id=candidate_id,
+            status=status,
+        )
+
+    @app.get("/grading/exams/{exam_id}/appeals")
+    def list_exam_appeals(
+        exam_id: int,
+        status: str | None = None,
+        user: CurrentUser = Depends(staff),
+    ):
+        return service.list_staff_appeals(
+            db, user.id, user.role, exam_id=exam_id, status=status
+        )
+
+    @app.get("/grading/exams/{exam_id}/candidates/{username}/appeals")
+    def list_candidate_appeals_staff(
+        exam_id: int,
+        username: str,
+        user: CurrentUser = Depends(staff),
+    ):
+        with db.read() as conn:
+            candidate = _resolve_candidate(conn, username)
+        return service.list_staff_appeals(
+            db,
+            user.id,
+            user.role,
+            exam_id=exam_id,
+            candidate_id=candidate["id"],
+        )
+
+    @app.get("/grading/appeals/{appeal_id}")
+    @app.get("/admin/appeals/{appeal_id}")
+    def get_staff_appeal(
+        appeal_id: int, user: CurrentUser = Depends(staff)
+    ):
+        # /admin/appeals/{id} is also reachable by graders for their assigned
+        # review; output sealing is handled in the service serializer.
+        return service.get_appeal_for_staff(db, appeal_id, user.id, user.role)
+
+    @app.post("/admin/appeals/{appeal_id}/assign", status_code=200)
+    @app.post("/admin/appeals/{appeal_id}/reviewers", status_code=200)
+    @app.post("/admin/appeals/{appeal_id}/assignment", status_code=200)
+    @app.put("/admin/appeals/{appeal_id}/assignment", status_code=200)
+    @app.post("/appeals/{appeal_id}/assign", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/assign", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/assignment", status_code=200)
+    @app.post("/admin/exams/{exam_id}/appeals/{appeal_id}/assign", status_code=200)
+    def assign_appeal(
+        appeal_id: int,
+        payload: AppealAssignIn,
+        request: Request,
+        exam_id: int | None = None,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        _check_appeal_exam(appeal_id, exam_id, user)
+        refs = payload.username_list()
+        ids = payload.id_list()
+        return service.assign_appeal(
+            db,
+            appeal_id,
+            _op_id(payload, request),
+            refs,
+            ids,
+            user.id,
+            clock,
+        )
+
+    @app.post("/grading/appeals/{appeal_id}/opinions", status_code=200)
+    @app.post("/appeals/{appeal_id}/opinions", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/opinion", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/reviews", status_code=200)
+    @app.post("/appeals/{appeal_id}/reviews", status_code=200)
+    @app.post("/grader/appeals/{appeal_id}/opinions", status_code=200)
+    def submit_appeal_opinion(
+        appeal_id: int,
+        payload: AppealDecisionIn,
+        request: Request,
+        user: CurrentUser = Depends(require_roles("grader", "admin")),
+    ):
+        decision, score, reason = _decision_fields(payload)
+        return service.submit_appeal_opinion(
+            db,
+            appeal_id,
+            user.id,
+            _op_id(payload, request),
+            decision,
+            score,
+            reason,
+            clock,
+        )
+
+    @app.post("/admin/appeals/{appeal_id}/arbitrate", status_code=200)
+    @app.post("/admin/appeals/{appeal_id}/decision", status_code=200)
+    @app.post("/admin/appeals/{appeal_id}/ruling", status_code=200)
+    @app.post("/appeals/{appeal_id}/arbitrate", status_code=200)
+    @app.post("/admin/appeals/{appeal_id}/arbitration", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/arbitrate", status_code=200)
+    @app.post("/grading/appeals/{appeal_id}/decision", status_code=200)
+    @app.post("/admin/exams/{exam_id}/appeals/{appeal_id}/arbitrate", status_code=200)
+    def arbitrate_appeal(
+        appeal_id: int,
+        payload: AppealDecisionIn,
+        request: Request,
+        exam_id: int | None = None,
+        user: CurrentUser = Depends(admin_only),
+    ):
+        _check_appeal_exam(appeal_id, exam_id, user)
+        decision, score, reason = _decision_fields(payload)
+        return service.arbitrate_appeal(
+            db,
+            appeal_id,
+            user.id,
+            _op_id(payload, request),
+            decision,
+            score,
+            reason,
+            clock,
+        )
+
     @app.get("/grading/exams/{exam_id}/candidates/{username}/results")
     def list_results(
         exam_id: int,
@@ -296,11 +635,18 @@ def create_app(
     def grading_history(
         exam_id: int,
         username: str,
-        _: CurrentUser = Depends(staff),
+        user: CurrentUser = Depends(staff),
     ):
         with db.read() as conn:
             candidate = _resolve_candidate(conn, username)
-        return service.get_grading_history(db, exam_id, candidate["id"], clock)
+        return service.get_grading_history(
+            db,
+            exam_id,
+            candidate["id"],
+            clock,
+            viewer_id=user.id,
+            viewer_role=user.role,
+        )
 
     return app
 

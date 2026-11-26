@@ -195,9 +195,16 @@ CREATE TABLE IF NOT EXISTS result_items (
     auto_score       INTEGER NOT NULL,
     -- NULL means no effective manual score; manual actions themselves are
     -- kept forever in manual_score_actions.
+    manual_action_id INTEGER REFERENCES manual_score_actions(id),
     manual_score     INTEGER,
     manual_reason    TEXT,
-    effective_score  INTEGER NOT NULL
+    effective_score  INTEGER NOT NULL,
+    -- Strong score provenance. Appeal rulings permanently override ordinary
+    -- manual/auto scoring for one exact exam/candidate/question.
+    appeal_ruling_id INTEGER,
+    score_source_type TEXT NOT NULL DEFAULT 'auto'
+        CHECK (score_source_type IN ('auto', 'manual', 'appeal_ruling')),
+    score_source_id  INTEGER
 );
 
 -- Full history of manual grading actions, including explicit revocations.
@@ -223,6 +230,103 @@ CREATE TABLE IF NOT EXISTS grading_runs (
     trigger      TEXT NOT NULL,
     created_at   TEXT NOT NULL
 );
+
+-- One score appeal per exact answer sheet + question. The basis_json row is
+-- deliberately frozen at opening: later publications never rewrite it.
+CREATE TABLE IF NOT EXISTS score_appeals (
+    id                          INTEGER PRIMARY KEY,
+    exam_id                     INTEGER NOT NULL REFERENCES exams(id),
+    candidate_id                INTEGER NOT NULL REFERENCES users(id),
+    attempt_id                  INTEGER REFERENCES attempts(id),
+    result_version_id           INTEGER NOT NULL REFERENCES result_versions(id),
+    result_version              INTEGER NOT NULL,
+    question_id                 INTEGER NOT NULL,
+    appealed_score              INTEGER NOT NULL,
+    reason                      TEXT NOT NULL,
+    basis_json                  TEXT NOT NULL,
+    status                      TEXT NOT NULL CHECK (status IN (
+                                    'pending_assignment',
+                                    'in_review',
+                                    'pending_arbitration',
+                                    'closed_rejected',
+                                    'closed_changed'
+                                )),
+    final_decision              TEXT CHECK (final_decision IN ('rejected', 'changed')),
+    final_score                 INTEGER,
+    final_reason                TEXT,
+    closure_kind                TEXT CHECK (closure_kind IN (
+                                    'reviewer_agreement', 'arbitration'
+                                )),
+    final_ruling_id             INTEGER,
+    arbitrator_id               INTEGER REFERENCES users(id),
+    correction_result_version_id INTEGER REFERENCES result_versions(id),
+    correction_result_version   INTEGER,
+    correction_published_at     TEXT,
+    created_at                  TEXT NOT NULL,
+    assigned_at                 TEXT,
+    closed_at                   TEXT,
+    UNIQUE (exam_id, candidate_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS idx_score_appeals_candidate
+    ON score_appeals(candidate_id, exam_id);
+CREATE INDEX IF NOT EXISTS idx_score_appeals_exam
+    ON score_appeals(exam_id, status);
+
+-- Exactly two grader assignment rows are created by one assignment action.
+CREATE TABLE IF NOT EXISTS appeal_assignments (
+    id          INTEGER PRIMARY KEY,
+    appeal_id   INTEGER NOT NULL REFERENCES score_appeals(id),
+    grader_id   INTEGER NOT NULL REFERENCES users(id),
+    slot        INTEGER NOT NULL CHECK (slot IN (1, 2)),
+    assigned_by INTEGER NOT NULL REFERENCES users(id),
+    created_at  TEXT NOT NULL,
+    UNIQUE (appeal_id, grader_id),
+    UNIQUE (appeal_id, slot)
+);
+
+-- Each assigned grader gets exactly one opinion row.
+CREATE TABLE IF NOT EXISTS appeal_opinions (
+    id          INTEGER PRIMARY KEY,
+    appeal_id   INTEGER NOT NULL REFERENCES score_appeals(id),
+    grader_id   INTEGER NOT NULL REFERENCES users(id),
+    decision    TEXT NOT NULL CHECK (decision IN ('rejected', 'changed')),
+    new_score   INTEGER,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (appeal_id, grader_id)
+);
+
+-- Formal closing rulings. Reviewer agreement creates a system-authored formal
+-- ruling; disagreement creates the administrator's arbitration ruling.
+CREATE TABLE IF NOT EXISTS appeal_rulings (
+    id           INTEGER PRIMARY KEY,
+    appeal_id    INTEGER NOT NULL REFERENCES score_appeals(id),
+    kind         TEXT NOT NULL CHECK (kind IN (
+                     'reviewer_agreement', 'arbitration'
+                 )),
+    decision     TEXT NOT NULL CHECK (decision IN ('rejected', 'changed')),
+    final_score  INTEGER,
+    reason       TEXT NOT NULL,
+    decider_id   INTEGER REFERENCES users(id),
+    created_at   TEXT NOT NULL,
+    result_version_id INTEGER REFERENCES result_versions(id)
+);
+
+-- Scoped idempotency records for opening/assignment/review/arbitration.
+-- Scope keeps independent resources from accidentally sharing an op id;
+-- request_hash makes reuse with a different request an explicit conflict.
+CREATE TABLE IF NOT EXISTS appeal_operations (
+    scope        TEXT NOT NULL,
+    op_id        TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    appeal_id    INTEGER REFERENCES score_appeals(id),
+    actor_id     INTEGER REFERENCES users(id),
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (scope, op_id),
+    UNIQUE (op_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appeal_operations_op_id
+    ON appeal_operations(op_id);
 """
 
 # Additive migrations for databases created before timed sessions existed.
@@ -240,13 +344,23 @@ _ADDED_COLUMNS = {
         ("graded_at", "TEXT"),
         ("candidate_paused", "INTEGER NOT NULL DEFAULT 0"),
     ],
+    "result_items": [
+        ("manual_action_id", "INTEGER"),
+        ("appeal_ruling_id", "INTEGER"),
+        ("score_source_type", "TEXT NOT NULL DEFAULT 'auto'"),
+        ("score_source_id", "INTEGER"),
+    ],
 }
 
 # Minimal credentials for the demo. Passwords are PBKDF2-hashed at seed time.
 SEED_USERS = [
     ("admin", "admin-pass-123", "admin", "题库管理员"),
-    ("grader", "grader-pass-123", "grader", "阅卷员"),
+    ("grader", "grader-pass-123", "grader", "阅卷员甲"),
+    ("grader1", "grader1-pass-123", "grader", "阅卷员一"),
+    ("grader2", "grader2-pass-123", "grader", "阅卷员乙"),
+    ("grader3", "grader3-pass-123", "grader", "阅卷员丙"),
     ("candidate", "candidate-pass-123", "candidate", "考生小明"),
+    ("candidate2", "candidate2-pass-123", "candidate", "考生小红"),
 ]
 
 

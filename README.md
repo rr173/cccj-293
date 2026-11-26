@@ -24,17 +24,22 @@ python3 -m venv .venv
 # 限时场次演示（进程内服务 + 可控虚拟时钟，零真实等待，同样全走 HTTP）
 .venv/bin/python scripts/demo_timed_http.py
 
-# 测试（含真实线程并发、幂等重试、冲突拒绝、重叠暂停、服务重启后惰性交卷）
+# 测试（含真实线程并发、幂等重试、冲突拒绝、重叠暂停、服务重启后惰性交卷、申诉结案/改分/发布竞争）
 .venv/bin/python -m pytest tests/ -v
+
+# 只跑单题成绩申诉的端到端 HTTP 验证
+.venv/bin/python -m pytest tests/test_score_appeals.py -q
 ```
 
 ## 最小账号（HTTP Basic，启动时自动播种）
 
 | 角色 | 用户名 | 密码 | 能做什么 |
 | --- | --- | --- | --- |
-| 管理员 | `admin` | `admin-pass-123` | 题库增改、发卷、配置限时场次、暂停/恢复、勘误答案键、重算、发布 |
+| 管理员 | `admin` | `admin-pass-123` | 题库增改、发卷、配置限时场次、暂停/恢复、勘误答案键、重算、发布、指派申诉阅卷员、仲裁 |
 | 阅卷员 | `grader` | `grader-pass-123` | 人工分/撤销、重算、发布、查全部结果与历史 |
-| 考生 | `candidate` | `candidate-pass-123` | 取卷、保存/提交答案、只看已发布成绩 |
+| 阅卷员 | `grader2` / `grader3` | `grader2-pass-123` / `grader3-pass-123` | 申诉复核演示账号；管理员一次指派其中两名不同阅卷员 |
+| 考生 | `candidate` | `candidate-pass-123` | 取卷、保存/提交答案、只看已发布成绩、提交/查看本人申诉 |
+| 考生 | `candidate2` | `candidate2-pass-123` | 用于验证不能查看他人申诉 |
 
 所有请求带 `Authorization: Basic base64(user:pass)`。密码以 PBKDF2-SHA256
 （20 万次迭代 + 每用户随机盐）存储，不存明文。
@@ -56,6 +61,112 @@ python3 -m venv .venv
 | 发布 | `POST /grading/.../publish` | staff | 必须显式指向 `result_version` |
 | 考生成绩 | `GET /exams/{eid}/result` | candidate | 仅返回已发布版本，未发布返回 404 |
 | 历史 | `GET /grading/.../history` | staff | 历次评分方案、机评 run、人工动作（含撤销）全量留痕 |
+
+## 单题成绩申诉 HTTP 流程
+
+申诉围绕一份答卷的一道题展开；`op_id` 与现有答案/监考接口一样是重试幂等键，
+也可改用 `Idempotency-Key` 请求头。同一个 `op_id` 用不同请求体再次提交会得到
+`409`。
+
+| 步骤 | 方法与路径 | 角色 | 关键语义 |
+| --- | --- | --- | --- |
+| 开案 | `POST /exams/{eid}/appeals` | candidate | body：`op_id/result_version/question_id/reason`；只能针对本人**当前已发布**版本中的题；每份答卷每题仅一次 |
+| 我的申诉 | `GET /exams/{eid}/appeals`、`GET /exams/{eid}/appeals/{aid}` | candidate | 只返回本人申诉、办理阶段和正式结案结论；不含阅卷意见 |
+| 全部我的 | `GET /my/appeals` | candidate | 跨考试查看本人申诉 |
+| 指派 | `POST /admin/appeals/{aid}/assign` | admin | body：`op_id/grader_usernames=[u1,u2]`；必须两名不同 `grader`；有该题普通人工给分/撤销历史者 `409` |
+| 办理详情 | `GET /grading/appeals/{aid}` | staff | 管理员可见全部意见；意见汇齐前，被指派阅卷员只见本人意见；考生走考生路由 |
+| 复核意见 | `POST /grading/appeals/{aid}/opinions` | assigned grader | body：`op_id/decision/reason/new_score?`；每人一次；`decision` 为 `rejected` 或 `changed` |
+| 仲裁 | `POST /admin/appeals/{aid}/arbitrate` | admin | 两人结论或改分不一致时进入 `pending_arbitration`；body 同意见；有利益冲突的管理员 `403` |
+| 列表/追溯 | `GET /grading/appeals`、`GET /grading/exams/{eid}/appeals` | staff | 可按 `exam_id/username/status/mine` 过滤；历史接口也在 `appeals` 键返回完整追溯 |
+| 发布 | 原入口 `POST /grading/exams/{eid}/candidates/{username}/publish` | staff | 申诉改判只生成新的 `pending` 结果版本，仍须显式发布最新版本 |
+
+开案时会冻结：申诉指定的成绩版本、该版单题得分、发卷试题快照、考生已交答案、
+对应评分方案。之后即使有更新版本发布，复核和改分校验仍以该冻结依据中的
+`appealed_score` 与原题 `max_score` 为准。
+
+### 结论与发布状态
+
+- 两名阅卷员均 `rejected`：直接 `closed_rejected`，不生成成绩版本。
+- 两名阅卷员均 `changed` 且 `new_score` 相同：`closed_changed`，以该分值结案。
+- 其他组合：状态变为 `pending_arbitration`，由管理员仲裁为 `rejected` 或
+  `changed`。
+- `changed` 的 `new_score` 必须是整数，满足 `0 <= new_score <= 原题满分`，且
+  `new_score != appealed_score`。
+- 改判结案时，服务复制该考生**最新生成的结果版本**（可能仍是 `pending`），
+  仅替换申诉题的 `effective_score` 并写入 `appeal_ruling` 评分来源；其他题的
+  未发布人工分原样保留，最新结果未使用的答案键勘误也不会借此次复制生效。
+- 申诉响应中的 `correction_status`：
+  - `not_required`：驳回；
+  - `pending_publication`：已结案且已生成待发布改分；
+  - `published`：当前已发布结果中包含该裁决（之后的重算/发布也会继续携带它）。
+
+### HTTP 请求示例
+
+```bash
+# 1) 考生对当前已发布的 v1 第 12 题申诉
+curl -u candidate:candidate-pass-123 \
+  -X POST http://127.0.0.1:8000/exams/3/appeals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "op_id": "appeal-20261126-q12-01",
+    "result_version": 1,
+    "question_id": 12,
+    "reason": "题干表述使我选择 B，申请复核得分"
+  }'
+# -> 201；响应中的 appeal_id 用于后续步骤
+
+# 2) 管理员一次指派两名不同阅卷员
+curl -u admin:admin-pass-123 \
+  -X POST http://127.0.0.1:8000/admin/appeals/7/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "op_id": "assign-appeal-7-01",
+    "grader_usernames": ["grader2", "grader3"]
+  }'
+
+# 3) 第一名阅卷员要求改为 4 分
+curl -u grader2:grader2-pass-123 \
+  -X POST http://127.0.0.1:8000/grading/appeals/7/opinions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "op_id": "review-g2-appeal-7",
+    "decision": "changed",
+    "new_score": 4,
+    "reason": "干扰项表述有歧义，按作答要点应给 4 分"
+  }'
+
+# 4) 第二名阅卷员驳回；结论分歧，等待管理员仲裁
+curl -u grader3:grader3-pass-123 \
+  -X POST http://127.0.0.1:8000/grading/appeals/7/opinions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "op_id": "review-g3-appeal-7",
+    "decision": "rejected",
+    "reason": "作答与正确选项集合不一致，维持 0 分"
+  }'
+
+# 5) 管理员仲裁改满分 5；响应给出 correction_result_version（例如 v3）
+curl -u admin:admin-pass-123 \
+  -X POST http://127.0.0.1:8000/admin/appeals/7/arbitrate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "op_id": "arbitrate-appeal-7-01",
+    "decision": "changed",
+    "new_score": 5,
+    "reason": "核对快照试题与答案后，仲裁认定应给满分"
+  }'
+
+# 6) 仍走原发布入口，发布包含裁决的最新结果版本
+curl -u grader:grader-pass-123 \
+  -X POST http://127.0.0.1:8000/grading/exams/3/candidates/candidate/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"result_version": 3}'
+```
+
+改判后普通重算仍会重新计算机评分并带入其他有效人工分，但申诉题会被永久标记为
+`score_source_type: "appeal_ruling"` 并使用裁决分；任何普通人工给分或撤销请求
+修改该题都会返回 `409`。完整 HTTP 行为与竞争验证见
+`tests/test_score_appeals.py`。
 
 ## 限时场次 HTTP 用法
 
@@ -156,6 +267,22 @@ python3 -m venv .venv
 14. **已交卷者不受后续动作影响。** 已交卷（含自动交卷）的考生，保存与主动
     交卷一律 `409`；对其的考生级暂停被拒；之后的勘误、重算、人工分、发布
     完全沿用既有流程，自动成绩与手工动作一样是普通的待发布结果版本。
+15. **申诉依据在开案时冻结，且每题一次。** `score_appeals` 对
+    `(exam_id,candidate_id,question_id)` 建唯一约束；只有当前 `published`
+    结果版本中的题能开案。`basis_json` 保存该版单题分、试题快照、已交答案和
+    评分方案，后续新版成绩发布不改变复核基准。
+16. **双阅卷员意见在汇齐前互相不可见。** 管理员一次写入两条不同指派；
+    `appeal_opinions` 对 `(appeal_id,grader_id)` 唯一。序列化层在两意见汇齐前
+    只向被指派者返回其本人意见，对考生始终剥离意见与内部 basis。曾对该
+    考生该题写入 `manual_score_actions`（包括撤销）的用户不能被指派或仲裁。
+17. **改判只生成新的待发布版本，并永久约束该题分数。** 结案与结果版本生成在
+    同一写事务中完成；改判版本复制最新结果版本的其他题目和 `scheme_id`，只
+    替换申诉题。之后 `_auto_grade` 始终应用生效的 `appeal_rulings` 改判分，
+    普通人工给分/撤销入口对该题返回 `409`。
+18. **申诉操作幂等，竞争由全局写锁和事务给出顺序。** 开案、指派、意见、仲裁
+    均在 `appeal_operations` 记录全局 `op_id` 与请求哈希；同请求重放不重复
+    结案或生成结果，同 `op_id` 不同请求返回 `409`。结案、其他题改分和发布
+    并发时，全局 `BEGIN IMMEDIATE` 事务序列化为一个一致先后顺序。
 
 ## 数据模型概览（`exam_service/schema.py`）
 
@@ -171,6 +298,10 @@ grading_schemes                          # 答案键版本（v1 发卷时生成�
 result_versions ──< result_items         # 每次评分动作一个不可变结果版本
 manual_score_actions                     # 人工分设置/撤销全历史
 grading_runs                             # 机评运行留痕（含 time limit 自动评分）
+score_appeals ──< appeal_assignments     # 单题申诉、冻结依据、两名指派阅卷员
+score_appeals ──< appeal_opinions        # 每人一次的复核意见（汇齐前保密）
+score_appeals ── appeal_rulings          # 一致结论或管理员仲裁的正式裁决
+appeal_operations                        # 开案/指派/复核/仲裁 op_id 幂等与请求哈希
 ```
 
 限时相关字段集中在 `attempts`：`timed_mode / duration_seconds /
