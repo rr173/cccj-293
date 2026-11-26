@@ -1,0 +1,10 @@
+# Runtime SQLite files
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
